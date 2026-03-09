@@ -1,363 +1,320 @@
 """
 Sidebar with hierarchical connection tree.
 
-Displays connections organized in groups using Gtk.TreeView.
+Displays connections organized in groups using QTreeWidget.
 Supports right-click context menu, double-click to connect,
-and drag-and-drop reordering.
+and live search filtering.
 """
 
-import gi
-gi.require_version('Gtk', '4.0')
+from __future__ import annotations
 
-from gi.repository import Gtk, GLib, Gdk, GObject, Pango
 from typing import Optional
+
+from PySide6.QtCore import Qt, Signal, QSortFilterProxyModel
+from PySide6.QtGui import QIcon, QAction
+from PySide6.QtWidgets import (
+    QWidget, QVBoxLayout, QHBoxLayout, QTreeWidget, QTreeWidgetItem,
+    QLineEdit, QToolButton, QMenu, QInputDialog, QMessageBox, QSizePolicy,
+    QToolBar,
+)
 
 from .connection import Connection, ConnectionManager
 
 
-# TreeStore columns
-COL_DISPLAY_NAME = 0  # str: Display text
-COL_ICON_NAME = 1     # str: Icon name
-COL_CONNECTION_ID = 2  # str: Connection ID (empty for groups)
-COL_GROUP_PATH = 3     # str: Group path (for group rows)
-COL_IS_GROUP = 4       # bool: True if this is a group row
-COL_TOOLTIP = 5        # str: Tooltip text
-
-
-class Sidebar(Gtk.Box):
+class Sidebar(QWidget):
     """
     Left panel showing connections grouped hierarchically.
 
     Signals:
-        connect-requested: User double-clicked a connection
-        edit-requested: User wants to edit a connection
-        add-requested: User wants to add a new connection
+        connect_requested(str): User double-clicked a connection (conn_id)
+        edit_requested(str):    User chose Edit from context menu (conn_id)
+        delete_requested(str):  User chose Delete from context menu (conn_id)
+        add_requested():        User wants to add a new connection
+        add_group_requested():  User wants to add a new group
     """
 
-    __gsignals__ = {
-        "connect-requested": (GObject.SignalFlags.RUN_LAST, None, (str,)),
-        "edit-requested": (GObject.SignalFlags.RUN_LAST, None, (str,)),
-        "add-requested": (GObject.SignalFlags.RUN_LAST, None, ()),
-        "delete-requested": (GObject.SignalFlags.RUN_LAST, None, (str,)),
-        "add-group-requested": (GObject.SignalFlags.RUN_LAST, None, ()),
-    }
+    connect_requested = Signal(str)
+    edit_requested = Signal(str)
+    delete_requested = Signal(str)
+    add_requested = Signal()
+    add_group_requested = Signal()
+
+    # Item data roles
+    _CONN_ID_ROLE = Qt.ItemDataRole.UserRole
+    _IS_GROUP_ROLE = Qt.ItemDataRole.UserRole + 1
+    _GROUP_PATH_ROLE = Qt.ItemDataRole.UserRole + 2
 
     def __init__(self, connection_manager: ConnectionManager, credential_store=None):
-        super().__init__(orientation=Gtk.Orientation.VERTICAL, spacing=0)
+        super().__init__()
         self.connection_manager = connection_manager
         self.credential_store = credential_store
 
-        self.set_size_request(200, -1)
-        self.add_css_class("sidebar")
-
-        # --- Search bar ---
-        self.search_entry = Gtk.SearchEntry()
-        self.search_entry.set_placeholder_text("Search connections...")
-        self.search_entry.set_margin_start(6)
-        self.search_entry.set_margin_end(6)
-        self.search_entry.set_margin_top(6)
-        self.search_entry.set_margin_bottom(6)
-        self.search_entry.connect("search-changed", self._on_search_changed)
-        self.append(self.search_entry)
-
-        # --- Toolbar ---
-        toolbar = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=2)
-        toolbar.set_margin_start(6)
-        toolbar.set_margin_end(6)
-        toolbar.set_margin_bottom(6)
-        toolbar.set_halign(Gtk.Align.CENTER)
-
-        btn_add = Gtk.Button(icon_name="list-add-symbolic")
-        btn_add.set_tooltip_text("Add Connection")
-        btn_add.connect("clicked", lambda _: self.emit("add-requested"))
-        btn_add.add_css_class("flat")
-        toolbar.append(btn_add)
-
-        btn_add_group = Gtk.Button(icon_name="folder-new-symbolic")
-        btn_add_group.set_tooltip_text("Add Group")
-        btn_add_group.connect("clicked", lambda _: self.emit("add-group-requested"))
-        btn_add_group.add_css_class("flat")
-        toolbar.append(btn_add_group)
-
-        btn_expand = Gtk.Button(icon_name="view-more-symbolic")
-        btn_expand.set_tooltip_text("Expand All")
-        btn_expand.connect("clicked", lambda _: self.tree_view.expand_all())
-        btn_expand.add_css_class("flat")
-        toolbar.append(btn_expand)
-
-        btn_collapse = Gtk.Button(icon_name="view-less-symbolic")
-        btn_collapse.set_tooltip_text("Collapse All")
-        btn_collapse.connect("clicked", lambda _: self.tree_view.collapse_all())
-        btn_collapse.add_css_class("flat")
-        toolbar.append(btn_collapse)
-
-        self.append(toolbar)
-
-        # Separator
-        self.append(Gtk.Separator(orientation=Gtk.Orientation.HORIZONTAL))
-
-        # --- Tree View ---
-        # TreeStore: display_name, icon_name, connection_id, group_path, is_group, tooltip
-        self.store = Gtk.TreeStore(str, str, str, str, bool, str)
-
-        # Filter model for search
-        self.filter_model = self.store.filter_new()
-        self.filter_model.set_visible_func(self._filter_func)
-        self._search_text = ""
-
-        self.tree_view = Gtk.TreeView(model=self.filter_model)
-        self.tree_view.set_headers_visible(False)
-        self.tree_view.set_enable_search(False)
-        self.tree_view.set_tooltip_column(COL_TOOLTIP)
-        self.tree_view.set_activate_on_single_click(False)
-
-        # Column with icon + text
-        column = Gtk.TreeViewColumn()
-        column.set_expand(True)
-
-        # Icon renderer
-        icon_renderer = Gtk.CellRendererPixbuf()
-        column.pack_start(icon_renderer, False)
-        column.add_attribute(icon_renderer, "icon-name", COL_ICON_NAME)
-
-        # Text renderer
-        text_renderer = Gtk.CellRendererText()
-        text_renderer.set_padding(4, 2)
-        text_renderer.set_property("ellipsize", Pango.EllipsizeMode.END)
-        column.pack_start(text_renderer, True)
-        column.add_attribute(text_renderer, "text", COL_DISPLAY_NAME)
-
-        self.tree_view.append_column(column)
-
-        # Double-click to connect
-        self.tree_view.connect("row-activated", self._on_row_activated)
-
-        # Right-click menu
-        click = Gtk.GestureClick(button=3)
-        click.connect("pressed", self._on_right_click)
-        self.tree_view.add_controller(click)
-
-        # Scrolled window for the tree
-        self._scrolled = Gtk.ScrolledWindow()
-        self._scrolled.set_vexpand(True)
-        self._scrolled.set_policy(Gtk.PolicyType.AUTOMATIC, Gtk.PolicyType.AUTOMATIC)
-        self._scrolled.set_child(self.tree_view)
-        self.append(self._scrolled)
-
-        # Initial population
+        self.setMinimumWidth(180)
+        self._build_ui()
         self.refresh()
 
+    # ------------------------------------------------------------------
+    # UI construction
+    # ------------------------------------------------------------------
+
+    def _build_ui(self):
+        layout = QVBoxLayout(self)
+        layout.setContentsMargins(0, 0, 0, 0)
+        layout.setSpacing(0)
+
+        # Toolbar row
+        toolbar = QToolBar()
+        toolbar.setMovable(False)
+        toolbar.setFloatable(False)
+        toolbar.setIconSize(toolbar.iconSize().__class__(16, 16))
+
+        self._act_add = QAction("＋", self)
+        self._act_add.setToolTip("Add Connection")
+        self._act_add.triggered.connect(self.add_requested.emit)
+        toolbar.addAction(self._act_add)
+
+        self._act_add_group = QAction("📁", self)
+        self._act_add_group.setToolTip("Add Group")
+        self._act_add_group.triggered.connect(self.add_group_requested.emit)
+        toolbar.addAction(self._act_add_group)
+
+        toolbar.addSeparator()
+
+        self._act_expand = QAction("⊞", self)
+        self._act_expand.setToolTip("Expand All")
+        self._act_expand.triggered.connect(self._expand_all)
+        toolbar.addAction(self._act_expand)
+
+        self._act_collapse = QAction("⊟", self)
+        self._act_collapse.setToolTip("Collapse All")
+        self._act_collapse.triggered.connect(self._collapse_all)
+        toolbar.addAction(self._act_collapse)
+
+        layout.addWidget(toolbar)
+
+        # Search bar
+        self._search = QLineEdit()
+        self._search.setPlaceholderText("Search connections…")
+        self._search.setClearButtonEnabled(True)
+        self._search.textChanged.connect(self._on_search_changed)
+        self._search.setContentsMargins(4, 4, 4, 4)
+        layout.addWidget(self._search)
+
+        # Tree widget
+        self._tree = QTreeWidget()
+        self._tree.setHeaderHidden(True)
+        self._tree.setColumnCount(1)
+        self._tree.setIndentation(16)
+        self._tree.setAnimated(True)
+        self._tree.setContextMenuPolicy(Qt.ContextMenuPolicy.CustomContextMenu)
+        self._tree.customContextMenuRequested.connect(self._on_context_menu)
+        self._tree.itemDoubleClicked.connect(self._on_item_double_clicked)
+        self._tree.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Expanding)
+        layout.addWidget(self._tree)
+
+    # ------------------------------------------------------------------
+    # Public API
+    # ------------------------------------------------------------------
+
     def refresh(self):
-        """Rebuild the tree from the connection manager."""
-        self.store.clear()
+        """Reload all connections from connection_manager and rebuild the tree."""
+        self._tree.clear()
+        filter_text = self._search.text().strip().lower()
 
-        # Build group structure and connection placement
-        groups = self.connection_manager.get_groups()
-        connections = self.connection_manager.get_connections()
+        # Map group_path -> QTreeWidgetItem
+        group_items: dict[str, QTreeWidgetItem] = {}
 
-        # Track created group rows by path
-        group_iters = {}
-
-        # Create group rows
-        for group_path in sorted(groups):
+        def get_group_item(group_path: str) -> QTreeWidgetItem:
+            if group_path in group_items:
+                return group_items[group_path]
             parts = group_path.split("/")
-            for i, part in enumerate(parts):
-                current_path = "/".join(parts[:i + 1])
-                if current_path not in group_iters:
-                    parent_path = "/".join(parts[:i]) if i > 0 else None
-                    parent_iter = group_iters.get(parent_path)
-                    iter_ = self.store.append(parent_iter, [
-                        part,                          # display name
-                        "folder-symbolic",             # icon
-                        "",                            # no connection ID
-                        current_path,                  # group path
-                        True,                          # is group
-                        f"Group: {current_path}",      # tooltip
-                    ])
-                    group_iters[current_path] = iter_
+            parent_path = "/".join(parts[:-1])
+            label = parts[-1]
+            if parent_path:
+                parent_item = get_group_item(parent_path)
+            else:
+                parent_item = self._tree.invisibleRootItem()
+            item = QTreeWidgetItem(parent_item, [f"📁 {label}"])
+            item.setData(0, self._IS_GROUP_ROLE, True)
+            item.setData(0, self._GROUP_PATH_ROLE, group_path)
+            item.setFlags(item.flags() | Qt.ItemFlag.ItemIsEnabled)
+            item.setExpanded(True)
+            group_items[group_path] = item
+            return item
+
+        # Build declared groups first (so empty groups appear)
+        for group_path in self.connection_manager.get_groups():
+            if group_path:
+                get_group_item(group_path)
 
         # Add connections
-        for conn in sorted(connections, key=lambda c: c.name.lower()):
-            parent_iter = group_iters.get(conn.group)
+        connections = self.connection_manager.get_connections()
+        for conn in connections:
+            # Apply search filter
+            if filter_text:
+                haystack = f"{conn.name} {conn.display_name()} {conn.group}".lower()
+                if filter_text not in haystack:
+                    continue
 
-            icon = "network-server-symbolic"
-            if self.credential_store and self.credential_store.has_credentials(conn.id):
-                icon = "dialog-password-symbolic"
+            dest = conn.display_name()
+            label = f"🖥 {conn.name}" if conn.name else f"🖥 {dest}"
+            tooltip = dest if conn.name else ""
 
-            tooltip = f"{conn.display_name()}"
-            if conn.description:
-                tooltip += f"\n{conn.description}"
-
-            self.store.append(parent_iter, [
-                conn.name or conn.display_name(),  # display name
-                icon,                              # icon
-                conn.id,                           # connection ID
-                conn.group,                        # group path
-                False,                             # not a group
-                tooltip,                           # tooltip
-            ])
-
-        # Expand all by default
-        self.tree_view.expand_all()
-        self.filter_model.refilter()
-
-    def get_selected_connection_id(self) -> Optional[str]:
-        """Get the connection ID of the selected row, or None."""
-        selection = self.tree_view.get_selection()
-        model, iter_ = selection.get_selected()
-        if iter_:
-            conn_id = model.get_value(iter_, COL_CONNECTION_ID)
-            is_group = model.get_value(iter_, COL_IS_GROUP)
-            if not is_group and conn_id:
-                return conn_id
-        return None
-
-    def get_selected_group_path(self) -> Optional[str]:
-        """Get the group path of the selected row, or None."""
-        selection = self.tree_view.get_selection()
-        model, iter_ = selection.get_selected()
-        if iter_:
-            is_group = model.get_value(iter_, COL_IS_GROUP)
-            if is_group:
-                return model.get_value(iter_, COL_GROUP_PATH)
-        return None
-
-    # --- Signal handlers ---
-
-    def _on_row_activated(self, tree_view, path, column):
-        """Handle double-click on a row."""
-        iter_ = self.filter_model.get_iter(path)
-        is_group = self.filter_model.get_value(iter_, COL_IS_GROUP)
-
-        if is_group:
-            # Toggle expand/collapse
-            if tree_view.row_expanded(path):
-                tree_view.collapse_row(path)
+            if conn.group:
+                parent = get_group_item(conn.group)
             else:
-                tree_view.expand_row(path, False)
-        else:
-            conn_id = self.filter_model.get_value(iter_, COL_CONNECTION_ID)
-            if conn_id:
-                self.emit("connect-requested", conn_id)
+                parent = self._tree.invisibleRootItem()
 
-    def _on_right_click(self, gesture, n_press, x, y):
-        """Show context menu on right-click using a plain Gtk.Popover."""
-        path_info = self.tree_view.get_path_at_pos(int(x), int(y))
+            item = QTreeWidgetItem(parent, [label])
+            item.setData(0, self._CONN_ID_ROLE, conn.id)
+            item.setData(0, self._IS_GROUP_ROLE, False)
+            item.setToolTip(0, tooltip)
+            item.setFlags(item.flags() | Qt.ItemFlag.ItemIsEnabled | Qt.ItemFlag.ItemIsSelectable)
 
-        # Build list of (label, callback) items
-        items: list[tuple[str, callable]] = []
+        # Expand all when filtering
+        if filter_text:
+            self._tree.expandAll()
 
-        if path_info:
-            path, column, cell_x, cell_y = path_info
-            self.tree_view.get_selection().select_path(path)
-
-            iter_ = self.filter_model.get_iter(path)
-            is_group = self.filter_model.get_value(iter_, COL_IS_GROUP)
-            conn_id = self.filter_model.get_value(iter_, COL_CONNECTION_ID)
-
-            if is_group:
-                items = [
-                    ("Add Connection Here", lambda _: self.emit("add-requested")),
-                    ("Add Subgroup", lambda _: self.emit("add-group-requested")),
-                    ("Delete Group", lambda _: self._delete_selected_group()),
-                ]
-            else:
-                items = [
-                    ("Connect", lambda _, cid=conn_id: self.emit("connect-requested", cid)),
-                    (None, None),  # separator
-                    ("Edit", lambda _, cid=conn_id: self.emit("edit-requested", cid)),
-                    ("Duplicate", lambda _, cid=conn_id: self._duplicate_connection(cid)),
-                    ("Delete", lambda _, cid=conn_id: self.emit("delete-requested", cid)),
-                ]
-        else:
-            items = [
-                ("Add Connection", lambda _: self.emit("add-requested")),
-                ("Add Group", lambda _: self.emit("add-group-requested")),
-            ]
-
-        # Build popover with buttons
-        box = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=0)
-        box.set_margin_top(4)
-        box.set_margin_bottom(4)
-        box.set_margin_start(4)
-        box.set_margin_end(4)
-
-        popover = Gtk.Popover()
-        popover.set_autohide(True)
-
-        for label, callback in items:
-            if label is None:
-                box.append(Gtk.Separator(orientation=Gtk.Orientation.HORIZONTAL))
-                continue
-            btn = Gtk.Button(label=label)
-            btn.add_css_class("flat")
-            btn.set_halign(Gtk.Align.FILL)
-            # Close popover first, then fire the action
-            def make_handler(cb, pop):
-                def handler(b):
-                    pop.popdown()
-                    cb(b)
-                return handler
-            btn.connect("clicked", make_handler(callback, popover))
-            box.append(btn)
-
-        popover.set_child(box)
-        popover.set_parent(self._scrolled)
-
-        # Translate coordinates from tree_view to scrolled window
-        result = self.tree_view.translate_coordinates(self._scrolled, x, y)
-        if result is not None:
-            sx, sy = result
-        else:
-            sx, sy = x, y
-        rect = Gdk.Rectangle()
-        rect.x = int(sx)
-        rect.y = int(sy)
-        rect.width = 1
-        rect.height = 1
-        popover.set_pointing_to(rect)
-        popover.connect("closed", lambda p: p.unparent())
-        popover.popup()
-
-    def _delete_selected_group(self):
-        """Delete the selected group."""
-        group_path = self.get_selected_group_path()
-        if group_path:
-            self.connection_manager.delete_group(group_path, delete_connections=False)
-            self.refresh()
-
-    def _duplicate_connection(self, conn_id: str):
-        """Duplicate a connection."""
-        conn = self.connection_manager.get_connection(conn_id)
-        if conn:
-            clone = conn.clone()
-            self.connection_manager.add_connection(clone)
-            self.refresh()
-
-    def _on_search_changed(self, entry):
-        """Handle search text changes."""
-        self._search_text = entry.get_text().lower()
-        self.filter_model.refilter()
-        if self._search_text:
-            self.tree_view.expand_all()
-
-    def _filter_func(self, model, iter_, data=None):
-        """Filter function for the tree filter model."""
-        if not self._search_text:
-            return True
-
-        # Show if this row matches
-        name = model.get_value(iter_, COL_DISPLAY_NAME)
-        if name and self._search_text in name.lower():
-            return True
-
-        # Show groups if any child matches
-        is_group = model.get_value(iter_, COL_IS_GROUP)
-        if is_group:
-            child = model.iter_children(iter_)
-            while child:
-                if self._filter_func(model, child):
+    def select_connection(self, conn_id: str):
+        """Programmatically select the tree item for the given connection ID."""
+        def _search_items(parent: QTreeWidgetItem):
+            for i in range(parent.childCount()):
+                child = parent.child(i)
+                if child.data(0, self._CONN_ID_ROLE) == conn_id:
+                    self._tree.setCurrentItem(child)
+                    self._tree.scrollToItem(child)
                     return True
-                child = model.iter_next(child)
+                if _search_items(child):
+                    return True
+            return False
 
-        return False
+        root = self._tree.invisibleRootItem()
+        _search_items(root)
+
+    # ------------------------------------------------------------------
+    # Slots / internal callbacks
+    # ------------------------------------------------------------------
+
+    def _on_search_changed(self, text: str):
+        self.refresh()
+
+    def _expand_all(self):
+        self._tree.expandAll()
+
+    def _collapse_all(self):
+        self._tree.collapseAll()
+
+    def _on_item_double_clicked(self, item: QTreeWidgetItem, column: int):
+        is_group = item.data(0, self._IS_GROUP_ROLE)
+        if is_group:
+            item.setExpanded(not item.isExpanded())
+            return
+        conn_id = item.data(0, self._CONN_ID_ROLE)
+        if conn_id:
+            self.connect_requested.emit(conn_id)
+
+    def _on_context_menu(self, pos):
+        item = self._tree.itemAt(pos)
+        if item is None:
+            return
+        is_group = item.data(0, self._IS_GROUP_ROLE)
+        global_pos = self._tree.viewport().mapToGlobal(pos)
+
+        if is_group:
+            self._show_group_menu(item, global_pos)
+        else:
+            self._show_connection_menu(item, global_pos)
+
+    def _show_connection_menu(self, item: QTreeWidgetItem, global_pos):
+        conn_id = item.data(0, self._CONN_ID_ROLE)
+        if not conn_id:
+            return
+        menu = QMenu(self)
+
+        act_connect = menu.addAction("🔌 Connect")
+        act_edit = menu.addAction("✏ Edit")
+        act_clone = menu.addAction("📋 Clone")
+        menu.addSeparator()
+        act_delete = menu.addAction("🗑 Delete")
+        menu.addSeparator()
+        act_export = menu.addAction("📤 Export")
+
+        chosen = menu.exec(global_pos)
+        if chosen == act_connect:
+            self.connect_requested.emit(conn_id)
+        elif chosen == act_edit:
+            self.edit_requested.emit(conn_id)
+        elif chosen == act_clone:
+            self._clone_connection(conn_id)
+        elif chosen == act_delete:
+            self.delete_requested.emit(conn_id)
+        elif chosen == act_export:
+            self._export_connection(conn_id)
+
+    def _show_group_menu(self, item: QTreeWidgetItem, global_pos):
+        group_path = item.data(0, self._GROUP_PATH_ROLE) or ""
+        menu = QMenu(self)
+
+        act_add = menu.addAction("➕ Add Connection to Group")
+        act_rename = menu.addAction("✏ Rename Group")
+        menu.addSeparator()
+        act_delete = menu.addAction("🗑 Delete Group (with connections)")
+        act_delete_empty = menu.addAction("🗑 Delete Group (keep connections)")
+
+        chosen = menu.exec(global_pos)
+        if chosen == act_add:
+            # Emit add_requested; the caller can pre-populate the group field
+            self.add_requested.emit()
+        elif chosen == act_rename:
+            self._rename_group(group_path)
+        elif chosen == act_delete:
+            self._delete_group(group_path, delete_connections=True)
+        elif chosen == act_delete_empty:
+            self._delete_group(group_path, delete_connections=False)
+
+    # ------------------------------------------------------------------
+    # Actions
+    # ------------------------------------------------------------------
+
+    def _clone_connection(self, conn_id: str):
+        conn = self.connection_manager.get_connection(conn_id)
+        if conn is None:
+            return
+        cloned = conn.clone()
+        self.connection_manager.add_connection(cloned)
+        self.refresh()
+
+    def _export_connection(self, conn_id: str):
+        conn = self.connection_manager.get_connection(conn_id)
+        if conn is None:
+            return
+        QMessageBox.information(
+            self,
+            "Export",
+            f"Connection command:\n\n{conn.command}",
+        )
+
+    def _rename_group(self, group_path: str):
+        parts = group_path.split("/")
+        current_name = parts[-1]
+        new_name, ok = QInputDialog.getText(
+            self, "Rename Group", "New group name:", text=current_name
+        )
+        if ok and new_name and new_name != current_name:
+            new_path = "/".join(parts[:-1] + [new_name]) if len(parts) > 1 else new_name
+            self.connection_manager.rename_group(group_path, new_path)
+            self.refresh()
+
+    def _delete_group(self, group_path: str, delete_connections: bool):
+        msg = (
+            f"Delete group '{group_path}' and all its connections?"
+            if delete_connections
+            else f"Delete group '{group_path}'? Connections will be moved to root."
+        )
+        reply = QMessageBox.question(
+            self, "Delete Group", msg,
+            QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+        )
+        if reply == QMessageBox.StandardButton.Yes:
+            self.connection_manager.delete_group(group_path, delete_connections=delete_connections)
+            self.refresh()

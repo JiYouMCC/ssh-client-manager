@@ -1,0 +1,142 @@
+<!DOCTYPE html>
+<html>
+<head>
+  <meta charset="UTF-8">
+  <style>
+    * { margin: 0; padding: 0; box-sizing: border-box; }
+    html, body { width: 100%; height: 100%; overflow: hidden; background: #1e1e2e; }
+    #terminal { width: 100%; height: 100%; }
+  </style>
+  <link rel="stylesheet" href="xterm.css">
+  <script src="xterm.js"></script>
+  <script src="xterm-addon-fit.js"></script>
+</head>
+<body>
+  <div id="terminal"></div>
+  <script>
+    const params = new URLSearchParams(window.location.search);
+    const wsPort = params.get('port');
+    const bgColor  = params.get('bg')   || '#1e1e2e';
+    const fgColor  = params.get('fg')   || '#cdd6f4';
+    const fontFamily = decodeURIComponent(params.get('font_family') || 'Consolas%2C%20monospace');
+    const fontSize = parseInt(params.get('font_size') || '12');
+    const scrollback = parseInt(params.get('scrollback') || '10000');
+    const cursorStyle = params.get('cursor') || 'block';
+
+    // Parse 16-color palette if provided
+    let palette = null;
+    const paletteParam = params.get('palette');
+    if (paletteParam) {
+      try { palette = JSON.parse(decodeURIComponent(paletteParam)); } catch(e) {}
+    }
+
+    const termOptions = {
+      fontFamily,
+      fontSize,
+      theme: { background: bgColor, foreground: fgColor },
+      scrollback,
+      cursorStyle,
+      allowTransparency: false,
+      convertEol: false,
+    };
+    if (palette && palette.length >= 16) {
+      termOptions.theme.black        = palette[0];
+      termOptions.theme.red          = palette[1];
+      termOptions.theme.green        = palette[2];
+      termOptions.theme.yellow       = palette[3];
+      termOptions.theme.blue         = palette[4];
+      termOptions.theme.magenta      = palette[5];
+      termOptions.theme.cyan         = palette[6];
+      termOptions.theme.white        = palette[7];
+      termOptions.theme.brightBlack  = palette[8];
+      termOptions.theme.brightRed    = palette[9];
+      termOptions.theme.brightGreen  = palette[10];
+      termOptions.theme.brightYellow = palette[11];
+      termOptions.theme.brightBlue   = palette[12];
+      termOptions.theme.brightMagenta= palette[13];
+      termOptions.theme.brightCyan   = palette[14];
+      termOptions.theme.brightWhite  = palette[15];
+    }
+
+    const term = new Terminal(termOptions);
+    const fitAddon = new FitAddon.FitAddon();
+    term.loadAddon(fitAddon);
+    term.open(document.getElementById('terminal'));
+    fitAddon.fit();
+
+    let ws = null;
+    let reconnectTimer = null;
+
+    function connect() {
+      if (!wsPort) {
+        term.write('\r\n\x1b[31mNo WebSocket port provided.\x1b[0m\r\n');
+        return;
+      }
+      ws = new WebSocket(`ws://127.0.0.1:${wsPort}`);
+      ws.binaryType = 'arraybuffer';
+
+      ws.onopen = () => {
+        // Send initial size
+        sendResize();
+      };
+
+      ws.onmessage = (e) => {
+        if (e.data instanceof ArrayBuffer) {
+          term.write(new Uint8Array(e.data));
+        } else {
+          try {
+            const msg = JSON.parse(e.data);
+            if (msg.type === 'title') {
+              document.title = msg.value;
+              window.dispatchEvent(new CustomEvent('terminal-title', { detail: msg.value }));
+            }
+          } catch (_) {
+            term.write(e.data);
+          }
+        }
+      };
+
+      ws.onerror = () => {};
+      ws.onclose = () => {
+        term.write('\r\n\x1b[90m[disconnected]\x1b[0m\r\n');
+      };
+    }
+
+    function sendResize() {
+      if (ws && ws.readyState === WebSocket.OPEN) {
+        ws.send(JSON.stringify({ type: 'resize', cols: term.cols, rows: term.rows }));
+      }
+    }
+
+    term.onData(data => {
+      if (ws && ws.readyState === WebSocket.OPEN) {
+        ws.send(data);
+      }
+    });
+
+    term.onResize(({ cols, rows }) => sendResize());
+
+    const resizeObserver = new ResizeObserver(() => {
+      fitAddon.fit();
+    });
+    resizeObserver.observe(document.getElementById('terminal'));
+
+    // Context menu: copy/paste via keyboard shortcut instead
+    // Ctrl+Shift+C = copy, Ctrl+Shift+V = paste
+    term.attachCustomKeyEventHandler((e) => {
+      if (e.ctrlKey && e.shiftKey && e.key === 'C') {
+        const sel = term.getSelection();
+        if (sel) navigator.clipboard.writeText(sel).catch(() => {});
+        return false;
+      }
+      if (e.ctrlKey && e.shiftKey && e.key === 'V') {
+        navigator.clipboard.readText().then(t => term.paste(t)).catch(() => {});
+        return false;
+      }
+      return true;
+    });
+
+    connect();
+  </script>
+</body>
+</html>

@@ -2,912 +2,486 @@
 Main application window.
 
 Combines the sidebar (connection tree), terminal panel (split tabs),
-toolbar, and menu into the main GTK4/libadwaita window.
+toolbar, and menu into the main PySide6 QMainWindow.
 """
 
-import gi
-gi.require_version('Gtk', '4.0')
-gi.require_version('Adw', '1')
-gi.require_version('Vte', '3.91')
+from __future__ import annotations
 
-from gi.repository import Gtk, Adw, GLib, Gdk, Gio, GObject, Vte
+import sys
+from typing import Optional
+
+from PySide6.QtCore import Qt, QTimer, QSize
+from PySide6.QtGui import QAction, QCloseEvent, QKeySequence
+from PySide6.QtWidgets import (
+    QMainWindow, QWidget, QSplitter, QToolBar, QStatusBar,
+    QMenuBar, QMenu, QMessageBox, QApplication, QLabel,
+)
 
 from .config import Config
 from .connection import Connection, ConnectionManager
 from .credential_store import CredentialStore
 from .ssh_handler import SSHHandler
-from .terminal_widget import TerminalWidget
 from .terminal_panel import TerminalPanel
 from .sidebar import Sidebar
-from .cluster_window import ClusterWindow
-from .connection_dialog import ConnectionDialog
-from .preferences_dialog import PreferencesDialog
+
+try:
+    from .connection_dialog import ConnectionDialog
+    _HAS_CONN_DIALOG = True
+except ImportError:
+    _HAS_CONN_DIALOG = False
+
+try:
+    from .preferences_dialog import PreferencesDialog
+    _HAS_PREFS_DIALOG = True
+except ImportError:
+    _HAS_PREFS_DIALOG = False
+
+try:
+    from .cluster_window import ClusterWindow
+    _HAS_CLUSTER = True
+except ImportError:
+    _HAS_CLUSTER = False
 
 
-class MainWindow(Adw.ApplicationWindow):
+class MainWindow(QMainWindow):
     """
     The main application window.
 
     Layout:
     ┌──────────────────────────────────────────────┐
-    │ HeaderBar  [≡] [+Local] [SplitH] [SplitV]   │
-    │            [Unsplit] [Cluster] [Prefs] [☰]   │
+    │ MenuBar                                       │
+    ├──────────────────────────────────────────────┤
+    │ ToolBar  [New Tab][Local][SplitH][SplitV]... │
     ├──────────┬───────────────────────────────────┤
     │ Sidebar  │ TerminalPanel                     │
-    │ ┌──────┐ │ ┌─────────────┬─────────────────┐ │
-    │ │Search│ │ │ Tab1  Tab2  │ Tab3  Tab4       │ │
-    │ ├──────┤ │ ├─────────────┼─────────────────┤ │
-    │ │Group1│ │ │             │                 │ │
-    │ │ Host1│ │ │  Terminal   │  Terminal        │ │
-    │ │ Host2│ │ │             │                 │ │
-    │ │Group2│ │ │             │                 │ │
-    │ │ Host3│ │ └─────────────┴─────────────────┘ │
-    └──────────┴───────────────────────────────────┘
+    │  Search  │  PaneTabWidget (splits/tabs)       │
+    │  Tree    │                                   │
+    ├──────────┴───────────────────────────────────┤
+    │ StatusBar                                    │
+    └──────────────────────────────────────────────┘
     """
 
-    def __init__(self, application: Adw.Application, config: Config):
-        super().__init__(
-            application=application,
-            title="SSH Client Manager",
-            default_width=config["window_width"],
-            default_height=config["window_height"],
-        )
-
+    def __init__(self, config: Config):
+        super().__init__()
         self.config = config
         self.connection_manager = ConnectionManager()
         self.credential_store = CredentialStore()
         self.ssh_handler = SSHHandler(self.credential_store)
 
-        # Cluster mode state
-        self._cluster_mode = False
-        self._cluster_window: ClusterWindow | None = None
+        self.setWindowTitle("SSH Client Manager")
+        self.resize(
+            int(config.get("window_width", 1200)),
+            int(config.get("window_height", 750)),
+        )
 
-        self._setup_actions()
         self._build_ui()
+        self._build_menu()
+        self._build_toolbar()
+        self._build_statusbar()
         self._connect_signals()
-        self._setup_keyboard_shortcuts()
+        self._restore_sidebar_width()
 
-        # Add a welcome local terminal on start if no connections open
-        GLib.idle_add(self._open_initial_terminal)
-
-    def _setup_actions(self):
-        """Register window-level actions."""
-        actions = {
-            "new-connection": self._on_new_connection,
-            "new-local": self._on_new_local_terminal,
-            "connect-selected": self._on_connect_selected,
-            "preferences": self._on_preferences,
-            "split-h": self._on_split_horizontal,
-            "split-v": self._on_split_vertical,
-            "unsplit": self._on_unsplit,
-            "cluster-toggle": self._on_cluster_toggle,
-            "close-tab": self._on_close_tab,
-            "next-tab": self._on_next_tab,
-            "prev-tab": self._on_prev_tab,
-            "toggle-sidebar": self._on_toggle_sidebar,
-            "search-terminal": self._on_search_terminal,
-            "import-connections": self._on_import_connections,
-            "export-connections": self._on_export_connections,
-            "about": self._on_about,
-            "quit": lambda *_: self.close(),
-        }
-
-        action_group = Gio.SimpleActionGroup()
-        for name, callback in actions.items():
-            action = Gio.SimpleAction(name=name)
-            action.connect("activate", callback)
-            action_group.add_action(action)
-
-        self.insert_action_group("win", action_group)
-
-        # Sidebar actions
-        sidebar_group = Gio.SimpleActionGroup()
-        sidebar_actions = {
-            "connect": self._on_sidebar_connect,
-            "edit": self._on_sidebar_edit,
-            "delete": self._on_sidebar_delete,
-            "duplicate": self._on_sidebar_duplicate,
-            "add-connection": lambda *_: self._on_new_connection(None, None),
-            "add-group": lambda *_: self._on_add_group(),
-            "add-subgroup": lambda *_: self._on_add_group(),
-            "delete-group": self._on_delete_group,
-        }
-        for name, callback in sidebar_actions.items():
-            action = Gio.SimpleAction(name=name)
-            action.connect("activate", callback)
-            sidebar_group.add_action(action)
-
-        self.insert_action_group("sidebar", sidebar_group)
-
-        # Terminal context menu actions
-        term_group = Gio.SimpleActionGroup()
-        term_actions = {
-            "copy": lambda *_: self._active_terminal_action("copy_clipboard"),
-            "paste": lambda *_: self._active_terminal_action("paste_clipboard"),
-            "select-all": lambda *_: self._active_terminal_action("select_all"),
-            "reset": lambda *_: self._active_terminal_action("reset_terminal"),
-            "clear": lambda *_: self._active_terminal_action("reset_terminal", True),
-        }
-        for name, callback in term_actions.items():
-            action = Gio.SimpleAction(name=name)
-            action.connect("activate", callback)
-            term_group.add_action(action)
-
-        self.insert_action_group("term", term_group)
+    # ------------------------------------------------------------------
+    # UI construction
+    # ------------------------------------------------------------------
 
     def _build_ui(self):
-        """Build the complete window UI."""
-        # Main vertical layout
-        main_box = Gtk.Box(orientation=Gtk.Orientation.VERTICAL)
-
-        # --- Header Bar ---
-        self.header_bar = Adw.HeaderBar()
-        self._build_header_bar()
-        main_box.append(self.header_bar)
-
-        # --- Main content: Sidebar + Terminal Panel ---
-        self.paned = Gtk.Paned(orientation=Gtk.Orientation.HORIZONTAL)
-        self.paned.set_vexpand(True)
-        self.paned.set_wide_handle(True)
-        self.paned.set_position(self.config["sidebar_width"])
-
-        # Sidebar
+        """Build central splitter with sidebar and terminal panel."""
+        self.terminal_panel = TerminalPanel(self.config)
         self.sidebar = Sidebar(self.connection_manager, self.credential_store)
 
-        # Terminal panel
-        self.terminal_panel = TerminalPanel(self.config)
+        self._splitter = QSplitter(Qt.Orientation.Horizontal)
+        self._splitter.addWidget(self.sidebar)
+        self._splitter.addWidget(self.terminal_panel)
 
-        self.paned.set_start_child(self.sidebar)
-        self.paned.set_end_child(self.terminal_panel)
+        sidebar_width = int(self.config.get("sidebar_width", 220))
+        total = self.width()
+        self._splitter.setSizes([sidebar_width, max(total - sidebar_width, 200)])
+        self._splitter.setCollapsible(0, True)
+        self._splitter.setCollapsible(1, False)
+        self.setCentralWidget(self._splitter)
 
-        # Keep the sidebar from being resizable to collapse
-        self.paned.set_shrink_start_child(False)
-        self.paned.set_shrink_end_child(False)
+    def _build_menu(self):
+        """Build QMenuBar."""
+        menubar = self.menuBar()
 
-        main_box.append(self.paned)
+        # File
+        file_menu = menubar.addMenu("&File")
 
-        # --- Status bar ---
-        self.status_bar = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=8)
-        self.status_bar.set_margin_start(8)
-        self.status_bar.set_margin_end(8)
-        self.status_bar.set_margin_top(2)
-        self.status_bar.set_margin_bottom(2)
-        self.status_label = Gtk.Label(label="Ready")
-        self.status_label.set_xalign(0)
-        self.status_label.add_css_class("dim-label")
-        self.status_label.set_hexpand(True)
-        self.status_bar.append(self.status_label)
+        act_new_tab = QAction("New &Tab", self)
+        act_new_tab.setShortcut(QKeySequence("Ctrl+T"))
+        act_new_tab.triggered.connect(self._on_new_tab)
+        file_menu.addAction(act_new_tab)
 
-        self.tab_count_label = Gtk.Label(label="0 tabs")
-        self.tab_count_label.add_css_class("dim-label")
-        self.status_bar.append(self.tab_count_label)
+        act_local = QAction("New &Local Shell", self)
+        act_local.setShortcut(QKeySequence("Ctrl+Shift+T"))
+        act_local.triggered.connect(self._on_local_shell)
+        file_menu.addAction(act_local)
 
-        main_box.append(self.status_bar)
+        file_menu.addSeparator()
 
-        self.set_content(main_box)
+        act_import = QAction("&Import Connections…", self)
+        act_import.triggered.connect(self._on_import)
+        file_menu.addAction(act_import)
 
-    def _build_header_bar(self):
-        """Build the header bar with buttons and menus."""
-        header = self.header_bar
+        act_export = QAction("&Export Connections…", self)
+        act_export.triggered.connect(self._on_export)
+        file_menu.addAction(act_export)
 
-        # Left side: Sidebar toggle + New Local
-        btn_sidebar = Gtk.Button(icon_name="sidebar-show-symbolic")
-        btn_sidebar.set_tooltip_text("Toggle Sidebar (F9)")
-        btn_sidebar.set_action_name("win.toggle-sidebar")
-        header.pack_start(btn_sidebar)
+        file_menu.addSeparator()
 
-        btn_local = Gtk.Button(icon_name="utilities-terminal-symbolic")
-        btn_local.set_tooltip_text("New Local Terminal")
-        btn_local.set_action_name("win.new-local")
-        header.pack_start(btn_local)
+        act_quit = QAction("&Quit", self)
+        act_quit.setShortcut(QKeySequence("Ctrl+Q"))
+        act_quit.triggered.connect(QApplication.instance().quit)
+        file_menu.addAction(act_quit)
 
-        # Split buttons
-        btn_split_h = Gtk.Button(icon_name="object-flip-horizontal-symbolic")
-        btn_split_h.set_tooltip_text("Split Horizontally")
-        btn_split_h.set_action_name("win.split-h")
-        header.pack_start(btn_split_h)
+        # View
+        view_menu = menubar.addMenu("&View")
 
-        btn_split_v = Gtk.Button(icon_name="object-flip-vertical-symbolic")
-        btn_split_v.set_tooltip_text("Split Vertically")
-        btn_split_v.set_action_name("win.split-v")
-        header.pack_start(btn_split_v)
+        self._act_sidebar = QAction("Toggle &Sidebar", self)
+        self._act_sidebar.setShortcut(QKeySequence("Ctrl+\\"))
+        self._act_sidebar.triggered.connect(self._on_toggle_sidebar)
+        view_menu.addAction(self._act_sidebar)
 
-        btn_unsplit = Gtk.Button(icon_name="view-restore-symbolic")
-        btn_unsplit.set_tooltip_text("Unsplit All")
-        btn_unsplit.set_action_name("win.unsplit")
-        header.pack_start(btn_unsplit)
+        act_unsplit = QAction("&Unsplit", self)
+        act_unsplit.triggered.connect(self._on_unsplit)
+        view_menu.addAction(act_unsplit)
 
-        # Right side: Cluster, Search, Menu
-        btn_cluster = Gtk.ToggleButton()
-        btn_cluster.set_icon_name("network-workgroup-symbolic")
-        btn_cluster.set_tooltip_text("Cluster Mode - Send to All Terminals")
-        btn_cluster.connect("toggled", self._on_cluster_button_toggled)
-        self._cluster_button = btn_cluster
-        header.pack_end(btn_cluster)
+        view_menu.addSeparator()
 
-        # App menu
-        menu_button = Gtk.MenuButton()
-        menu_button.set_icon_name("open-menu-symbolic")
-        menu_button.set_tooltip_text("Menu")
-        menu_button.set_menu_model(self._build_app_menu())
-        header.pack_end(menu_button)
+        act_prefs = QAction("&Preferences…", self)
+        act_prefs.setShortcut(QKeySequence("Ctrl+,"))
+        act_prefs.triggered.connect(self._on_preferences)
+        view_menu.addAction(act_prefs)
 
-    def _build_app_menu(self) -> Gio.Menu:
-        """Build the application menu."""
-        menu = Gio.Menu()
+        # Help
+        help_menu = menubar.addMenu("&Help")
+        act_about = QAction("&About", self)
+        act_about.triggered.connect(self._on_about)
+        help_menu.addAction(act_about)
 
-        section1 = Gio.Menu()
-        section1.append("New Connection", "win.new-connection")
-        section1.append("New Local Terminal", "win.new-local")
-        menu.append_section(None, section1)
+    def _build_toolbar(self):
+        """Build main toolbar."""
+        tb = QToolBar("Main Toolbar")
+        tb.setMovable(False)
+        tb.setIconSize(QSize(20, 20))
+        tb.setToolButtonStyle(Qt.ToolButtonStyle.ToolButtonTextBesideIcon)
+        self.addToolBar(tb)
 
-        section2 = Gio.Menu()
-        section2.append("Import Connections", "win.import-connections")
-        section2.append("Export Connections", "win.export-connections")
-        menu.append_section(None, section2)
+        act_new = QAction("⊞ New Tab", self)
+        act_new.setToolTip("Open connection in new tab (Ctrl+T)")
+        act_new.triggered.connect(self._on_new_tab)
+        tb.addAction(act_new)
 
-        section3 = Gio.Menu()
-        section3.append("Preferences", "win.preferences")
-        section3.append("About", "win.about")
-        menu.append_section(None, section3)
+        act_local = QAction("💻 Local Shell", self)
+        act_local.setToolTip("Open local shell tab (Ctrl+Shift+T)")
+        act_local.triggered.connect(self._on_local_shell)
+        tb.addAction(act_local)
 
-        section4 = Gio.Menu()
-        section4.append("Quit", "win.quit")
-        menu.append_section(None, section4)
+        tb.addSeparator()
 
-        return menu
+        act_splith = QAction("⊟ Split H", self)
+        act_splith.setToolTip("Split terminal horizontally")
+        act_splith.triggered.connect(self._on_split_horizontal)
+        tb.addAction(act_splith)
+
+        act_splitv = QAction("⊞ Split V", self)
+        act_splitv.setToolTip("Split terminal vertically")
+        act_splitv.triggered.connect(self._on_split_vertical)
+        tb.addAction(act_splitv)
+
+        act_unsplit = QAction("▣ Unsplit", self)
+        act_unsplit.setToolTip("Remove splits")
+        act_unsplit.triggered.connect(self._on_unsplit)
+        tb.addAction(act_unsplit)
+
+        tb.addSeparator()
+
+        self._act_cluster = QAction("📡 Cluster", self)
+        self._act_cluster.setToolTip("Cluster mode — send to all terminals")
+        self._act_cluster.setCheckable(True)
+        self._act_cluster.triggered.connect(self._on_cluster)
+        tb.addAction(self._act_cluster)
+
+        tb.addSeparator()
+
+        act_prefs = QAction("⚙ Prefs", self)
+        act_prefs.setToolTip("Open preferences")
+        act_prefs.triggered.connect(self._on_preferences)
+        tb.addAction(act_prefs)
+
+    def _build_statusbar(self):
+        """Build status bar with connection count and active terminal title."""
+        self._statusbar = QStatusBar()
+        self.setStatusBar(self._statusbar)
+
+        self._status_conn_count = QLabel("Connections: 0")
+        self._status_title = QLabel("")
+
+        self._statusbar.addWidget(self._status_conn_count)
+        self._statusbar.addPermanentWidget(self._status_title)
+        self._update_status()
 
     def _connect_signals(self):
-        """Connect signals from child widgets."""
-        # Sidebar signals
-        self.sidebar.connect("connect-requested", self._on_sidebar_connect_by_id)
-        self.sidebar.connect("edit-requested",
-                             lambda _, cid: self._edit_connection(cid))
-        self.sidebar.connect("add-requested",
-                             lambda _: self._on_new_connection(None, None))
-        self.sidebar.connect("add-group-requested",
-                             lambda _: self._on_add_group())
+        """Wire up sidebar and terminal panel signals."""
+        self.sidebar.connect_requested.connect(self._on_connect_requested)
+        self.sidebar.edit_requested.connect(self._on_edit_requested)
+        self.sidebar.delete_requested.connect(self._on_delete_requested)
+        self.sidebar.add_requested.connect(self._on_add_connection)
+        self.sidebar.add_group_requested.connect(self._on_add_group)
 
-        # Terminal panel signals
-        self.terminal_panel.connect("tab-added", self._on_tab_added)
-        self.terminal_panel.connect("tab-removed", self._on_tab_removed)
-        self.terminal_panel.connect("active-terminal-changed",
-                                    self._on_active_terminal_changed)
-        self.terminal_panel.connect("terminal-title-changed",
-                                    self._on_terminal_title_changed)
-
-        # Handle window close
-        self.connect("close-request", self._on_close_request)
-
-    def _setup_keyboard_shortcuts(self):
-        """Set up keyboard shortcuts."""
-        key_ctrl = Gtk.EventControllerKey()
-        key_ctrl.connect("key-pressed", self._on_key_pressed)
-        self.add_controller(key_ctrl)
-
-    # =====================================================================
-    # Connection Operations
-    # =====================================================================
-
-    def open_connection(self, connection_id: str):
-        """Open a new terminal tab for the given connection."""
-        conn = self.connection_manager.get_connection(connection_id)
-        if not conn:
-            self._set_status(f"Connection not found: {connection_id}")
-            return
-
-        # Create terminal widget
-        terminal = TerminalWidget(self.config, conn)
-
-        # Build SSH command (parsed from the command field) and environment
-        ssh_cmd = self.ssh_handler.build_ssh_command(conn)
-        env = self.ssh_handler.build_environment(conn)
-
-        # Add tab
-        title = conn.name or conn.display_name()
-        self.terminal_panel.add_tab(terminal, conn, title)
-
-        # Spawn SSH process
-        terminal.spawn_command(ssh_cmd, env)
-
-        # Schedule post-login commands
-        commands = self.ssh_handler.get_post_login_commands(conn)
-        if commands:
-            self._schedule_post_login_commands(terminal, commands)
-
-        # Clean up askpass script after delay
-        GLib.timeout_add(15000, lambda: self.ssh_handler.cleanup_askpass(conn.id) or False)
-
-        self._set_status(f"Connected: {conn.name}")
-
-    def open_local_terminal(self):
-        """Open a new local shell terminal tab."""
-        terminal = TerminalWidget(self.config)
-        shell_cmd = SSHHandler.get_local_shell_command()
-        self.terminal_panel.add_tab(terminal, None, "Local")
-        terminal.spawn_command(shell_cmd)
-        self._set_status("Local terminal opened")
-
-    def _schedule_post_login_commands(self, terminal: TerminalWidget,
-                                      commands: list[str]):
-        """Send post-login commands after detecting a shell prompt.
-
-        Polls the terminal text every 500 ms looking for a recognisable
-        shell prompt (``$ ``, ``# ``, ``% ``, ``> ``) on the line where
-        the cursor sits.  Polling starts after 1 s to skip the initial
-        SSH handshake / banner noise.
-
-        A safety ceiling of 30 s ensures we don't poll forever if the
-        prompt pattern is unusual.
-        """
-        import re
-
-        # Matches typical Bash/Zsh/Fish/Ksh prompts:
-        #   [user@host ~]$   user@host:~$   host%   root#   >
-        prompt_re = re.compile(r'[\$#%>]\s*$')
-
-        state = {'fired': False, 'polls': 0}
-        max_polls = 58  # 1 s initial + up to 58 × 500 ms ≈ 30 s
-
-        def _send_commands():
-            """Send the commands with optional inter-command delays."""
-            if state['fired']:
-                return
-            state['fired'] = True
-
-            delay_ms = 200  # tiny gap after prompt detected
-            for cmd in commands:
-                if cmd.startswith("##D="):
-                    try:
-                        delay_ms += int(cmd[4:])
-                    except ValueError:
-                        pass
-                    continue
-                GLib.timeout_add(
-                    delay_ms,
-                    lambda t=terminal, c=cmd: (t.feed_child(c + "\n"), False)[1]
-                )
-                delay_ms += 200
-
-        def _poll_for_prompt():
-            """Check whether the terminal is showing a shell prompt."""
-            if state['fired']:
-                return False  # stop polling
-
-            state['polls'] += 1
-
-            # Safety ceiling – send anyway
-            if state['polls'] > max_polls:
-                _send_commands()
-                return False
-
-            try:
-                vte = terminal.vte
-                col, row = vte.get_cursor_position()
-                # Read the cursor line and the one above (prompt may span)
-                text = vte.get_text_range_format(
-                    Vte.Format.TEXT, max(0, row - 1), 0, row, 300
-                )
-                if isinstance(text, tuple):
-                    text = text[0]
-                if text and prompt_re.search(text.rstrip('\n')):
-                    _send_commands()
-                    return False
-            except Exception:
-                pass
-
-            # Fallback: scan the last non-empty line of all visible text
-            try:
-                text = terminal.vte.get_text_format(Vte.Format.TEXT)
-                if isinstance(text, tuple):
-                    text = text[0]
-                if text:
-                    lines = text.rstrip().split('\n')
-                    if lines and prompt_re.search(lines[-1]):
-                        _send_commands()
-                        return False
-            except Exception:
-                pass
-
-            return True  # keep polling
-
-        # Start polling after 1 s, then every 500 ms
-        GLib.timeout_add(1000, lambda: (GLib.timeout_add(500, _poll_for_prompt), False)[1])
-
-    # =====================================================================
-    # Action Handlers
-    # =====================================================================
-
-    def _on_new_connection(self, action, param):
-        """Open the new connection dialog."""
-        dialog = ConnectionDialog(
-            self, self.connection_manager,
-            self.credential_store
-        )
-        dialog.connect("connection-saved", self._on_connection_saved)
-        dialog.present()
-
-    def _on_new_local_terminal(self, action, param):
-        """Open a new local terminal."""
-        self.open_local_terminal()
-
-    def _on_connect_selected(self, action, param):
-        """Connect to the selected connection in sidebar."""
-        conn_id = self.sidebar.get_selected_connection_id()
-        if conn_id:
-            self.open_connection(conn_id)
-
-    def _on_preferences(self, action, param):
-        """Open preferences dialog."""
-        dialog = PreferencesDialog(self, self.config)
-        dialog.present()
-
-    def _on_split_horizontal(self, action, param):
-        """Split the terminal area horizontally."""
-        self.terminal_panel.split(Gtk.Orientation.HORIZONTAL)
-
-    def _on_split_vertical(self, action, param):
-        """Split the terminal area vertically."""
-        self.terminal_panel.split(Gtk.Orientation.VERTICAL)
-
-    def _on_unsplit(self, action, param):
-        """Remove all splits."""
-        self.terminal_panel.unsplit()
-
-    def _on_cluster_toggle(self, action, param):
-        """Toggle cluster mode (keyboard shortcut)."""
-        new_state = not self._cluster_mode
-        self._cluster_button.set_active(new_state)
-
-    def _on_cluster_button_toggled(self, button):
-        """Open or close the cluster window."""
-        self._cluster_mode = button.get_active()
-        if self._cluster_mode:
-            self._open_cluster_window()
-        else:
-            self._close_cluster_window()
-
-    def _open_cluster_window(self):
-        """Open the cluster popup window."""
-        if self._cluster_window is not None:
-            self._cluster_window.present()
-            return
-        self._cluster_window = ClusterWindow(self, self.terminal_panel)
-        self._cluster_window.connect(
-            "close-request", self._on_cluster_window_closed
-        )
-        self._cluster_window.present()
-
-    def _close_cluster_window(self):
-        """Close the cluster popup window and clear highlights."""
-        if self._cluster_window is not None:
-            self._cluster_window.close()
-            self._cluster_window = None
-        self.terminal_panel.clear_cluster_highlights()
-
-    def _on_cluster_window_closed(self, *_):
-        """Called when the user closes the cluster window directly."""
-        self._cluster_window = None
-        self._cluster_mode = False
-        self._cluster_button.set_active(False)
-        return False  # allow default close
-
-    def _on_close_tab(self, action, param):
-        """Close the current tab."""
-        self.terminal_panel.close_current_tab()
-
-    def _on_next_tab(self, action, param):
-        """Switch to next tab."""
-        self.terminal_panel.next_tab()
-
-    def _on_prev_tab(self, action, param):
-        """Switch to previous tab."""
-        self.terminal_panel.prev_tab()
-
-    def _on_toggle_sidebar(self, action, param):
-        """Toggle sidebar visibility."""
-        visible = self.sidebar.get_visible()
-        self.sidebar.set_visible(not visible)
-
-    def _on_search_terminal(self, action, param):
-        """Open search in current terminal."""
-        terminal = self.terminal_panel.focused_terminal
-        if terminal:
-            # Create inline search bar
-            self._show_search_bar(terminal)
-
-    def _on_import_connections(self, action, param):
-        """Import connections from file."""
+        # Update status bar when active terminal title changes
         try:
-            dialog = Gtk.FileDialog()
-            dialog.set_title("Import Connections")
-            dialog.open(self, None, self._on_import_file_chosen)
+            active = self.terminal_panel.active_terminal
+            if active:
+                active.title_changed.connect(self._on_terminal_title_changed)
         except Exception:
-            chooser = Gtk.FileChooserNative(
-                title="Import Connections",
-                transient_for=self,
-                action=Gtk.FileChooserAction.OPEN,
+            pass
+
+    # ------------------------------------------------------------------
+    # Sidebar signal handlers
+    # ------------------------------------------------------------------
+
+    def _on_connect_requested(self, conn_id: str):
+        """Connect to the selected connection."""
+        conn = self.connection_manager.get_connection(conn_id)
+        if conn is None:
+            QMessageBox.warning(self, "Not Found", f"Connection {conn_id!r} not found.")
+            return
+        self._do_connect(conn)
+
+    def _on_edit_requested(self, conn_id: str):
+        """Open the edit dialog for a connection."""
+        conn = self.connection_manager.get_connection(conn_id)
+        if conn is None:
+            return
+        if not _HAS_CONN_DIALOG:
+            QMessageBox.information(
+                self, "Not Available",
+                "Connection editor dialog is not yet implemented."
             )
-            chooser.connect("response", self._on_import_chooser_response)
-            chooser.show()
-
-    def _on_export_connections(self, action, param):
-        """Export connections to file."""
-        try:
-            dialog = Gtk.FileDialog()
-            dialog.set_title("Export Connections")
-            dialog.save(self, None, self._on_export_file_chosen)
-        except Exception:
-            chooser = Gtk.FileChooserNative(
-                title="Export Connections",
-                transient_for=self,
-                action=Gtk.FileChooserAction.SAVE,
-            )
-            chooser.connect("response", self._on_export_chooser_response)
-            chooser.show()
-
-    def _on_import_file_chosen(self, dialog, result):
-        try:
-            file = dialog.open_finish(result)
-            if file:
-                with open(file.get_path(), "r") as f:
-                    self.connection_manager.import_connections(f.read())
-                self.sidebar.refresh()
-                self._set_status("Connections imported")
-        except Exception as e:
-            self._set_status(f"Import failed: {e}")
-
-    def _on_export_file_chosen(self, dialog, result):
-        try:
-            file = dialog.save_finish(result)
-            if file:
-                data = self.connection_manager.export_connections()
-                with open(file.get_path(), "w") as f:
-                    f.write(data)
-                self._set_status("Connections exported")
-        except Exception as e:
-            self._set_status(f"Export failed: {e}")
-
-    def _on_import_chooser_response(self, chooser, response):
-        if response == Gtk.ResponseType.ACCEPT:
-            file = chooser.get_file()
-            if file:
-                try:
-                    with open(file.get_path(), "r") as f:
-                        self.connection_manager.import_connections(f.read())
-                    self.sidebar.refresh()
-                    self._set_status("Connections imported")
-                except Exception as e:
-                    self._set_status(f"Import failed: {e}")
-
-    def _on_export_chooser_response(self, chooser, response):
-        if response == Gtk.ResponseType.ACCEPT:
-            file = chooser.get_file()
-            if file:
-                data = self.connection_manager.export_connections()
-                try:
-                    with open(file.get_path(), "w") as f:
-                        f.write(data)
-                    self._set_status("Connections exported")
-                except Exception as e:
-                    self._set_status(f"Export failed: {e}")
-
-    def _on_about(self, action, param):
-        """Show about dialog."""
-        try:
-            about = Adw.AboutWindow(
-                transient_for=self,
-                application_name="SSH Client Manager",
-                application_icon="utilities-terminal",
-                version="1.0.0",
-                developer_name="SSH Client Manager Contributors",
-                license_type=Gtk.License.GPL_3_0,
-                comments="A modern SSH connection manager with GTK4.\n\n"
-                         "Features:\n"
-                         "- Split terminals (horizontal/vertical)\n"
-                         "- Encrypted credential storage\n"
-                         "- Group management\n"
-                         "- Cluster mode\n"
-                         "- No expect dependency",
-                website="https://github.com/ssh-client-manager",
-            )
-            about.present()
-        except TypeError:
-            # Older Adw fallback
-            dialog = Gtk.AboutDialog(
-                transient_for=self,
-                modal=True,
-                program_name="SSH Client Manager",
-                version="1.0.0",
-                license_type=Gtk.License.GPL_3_0,
-            )
-            dialog.present()
-
-    # =====================================================================
-    # Sidebar Action Handlers
-    # =====================================================================
-
-    def _on_sidebar_connect(self, action, param):
-        conn_id = self.sidebar.get_selected_connection_id()
-        if conn_id:
-            self.open_connection(conn_id)
-
-    def _on_sidebar_connect_by_id(self, sidebar, conn_id):
-        self.open_connection(conn_id)
-
-    def _on_sidebar_edit(self, action, param):
-        conn_id = self.sidebar.get_selected_connection_id()
-        if conn_id:
-            self._edit_connection(conn_id)
-
-    def _on_sidebar_delete(self, action, param):
-        conn_id = self.sidebar.get_selected_connection_id()
-        if conn_id:
-            self.connection_manager.delete_connection(conn_id)
-            self.credential_store.delete_credentials(conn_id)
+            return
+        dlg = ConnectionDialog(self, self.connection_manager, self.credential_store, conn)
+        if dlg.exec():
             self.sidebar.refresh()
-            self._set_status("Connection deleted")
+            self._update_status()
 
-    def _on_sidebar_duplicate(self, action, param):
-        conn_id = self.sidebar.get_selected_connection_id()
-        if conn_id:
-            conn = self.connection_manager.get_connection(conn_id)
-            if conn:
-                new_conn = conn.clone()
-                self.connection_manager.add_connection(new_conn)
-                # Copy credentials
-                password = self.credential_store.get_password(conn_id)
-                if password:
-                    self.credential_store.store_password(new_conn.id, password)
-                pp1 = self.credential_store.get_passphrase1(conn_id)
-                if pp1:
-                    self.credential_store.store_passphrase1(new_conn.id, pp1)
-                pp2 = self.credential_store.get_passphrase2(conn_id)
-                if pp2:
-                    self.credential_store.store_passphrase2(new_conn.id, pp2)
-                self.sidebar.refresh()
-                self._set_status(f"Connection duplicated: {new_conn.name}")
+    def _on_delete_requested(self, conn_id: str):
+        """Confirm and delete a connection."""
+        conn = self.connection_manager.get_connection(conn_id)
+        name = conn.name if conn else conn_id
+        reply = QMessageBox.question(
+            self, "Delete Connection",
+            f"Delete connection '{name}'?",
+            QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+        )
+        if reply == QMessageBox.StandardButton.Yes:
+            self.connection_manager.delete_connection(conn_id)
+            self.sidebar.refresh()
+            self._update_status()
+
+    def _on_add_connection(self):
+        """Open dialog to add a new connection."""
+        if not _HAS_CONN_DIALOG:
+            QMessageBox.information(
+                self, "Not Available",
+                "Connection editor dialog is not yet implemented."
+            )
+            return
+        dlg = ConnectionDialog(self, self.connection_manager, self.credential_store)
+        if dlg.exec():
+            self.sidebar.refresh()
+            self._update_status()
 
     def _on_add_group(self):
-        """Show a simple dialog to add a new group."""
-        dialog = Adw.MessageDialog(
-            transient_for=self,
-            heading="New Group",
-            body="Enter group name (use / for subgroups, e.g. Production/Web):",
-        )
-        dialog.add_response("cancel", "Cancel")
-        dialog.add_response("add", "Add")
-        dialog.set_response_appearance("add", Adw.ResponseAppearance.SUGGESTED)
-
-        # Add entry
-        entry = Gtk.Entry()
-        entry.set_placeholder_text("Group Name")
-        entry.set_margin_start(12)
-        entry.set_margin_end(12)
-        dialog.set_extra_child(entry)
-
-        dialog.connect("response", lambda d, r: self._on_add_group_response(d, r, entry))
-        dialog.present()
-
-    def _on_add_group_response(self, dialog, response, entry):
-        if response == "add":
-            group_name = entry.get_text().strip()
-            if group_name:
-                self.connection_manager.add_group(group_name)
-                self.sidebar.refresh()
-                self._set_status(f"Group added: {group_name}")
-
-    def _on_delete_group(self, action, param):
-        group_path = self.sidebar.get_selected_group_path()
-        if group_path:
-            self.connection_manager.delete_group(group_path, delete_connections=False)
+        """Prompt user for a new group name."""
+        from PySide6.QtWidgets import QInputDialog
+        name, ok = QInputDialog.getText(self, "Add Group", "Group name:")
+        if ok and name.strip():
+            self.connection_manager.add_group(name.strip())
             self.sidebar.refresh()
-            self._set_status(f"Group deleted: {group_path}")
 
-    def _edit_connection(self, connection_id: str):
-        """Open the edit dialog for a connection."""
-        conn = self.connection_manager.get_connection(connection_id)
-        if not conn:
+    # ------------------------------------------------------------------
+    # Connection / terminal actions
+    # ------------------------------------------------------------------
+
+    def _do_connect(self, conn: Connection):
+        """Create an SSH session and open it in a new terminal tab."""
+        try:
+            session = self.ssh_handler.create_session(conn)
+        except Exception as exc:
+            QMessageBox.critical(self, "Connection Error", str(exc))
             return
 
-        dialog = ConnectionDialog(
-            self, self.connection_manager,
-            self.credential_store, conn
+        title = conn.name or conn.display_name()
+        self.terminal_panel.new_tab(session, conn, title)
+
+        # Send post-login commands after a short delay
+        post_cmds = self.ssh_handler.get_post_login_commands(conn)
+        if post_cmds:
+            QTimer.singleShot(500, lambda: self._send_post_commands(post_cmds))
+
+        self._update_status()
+
+    def _send_post_commands(self, commands: list[str]):
+        """Send post-login commands to the currently active terminal."""
+        try:
+            terminal = self.terminal_panel.active_terminal
+            if terminal:
+                for cmd in commands:
+                    terminal.send_text(cmd + "\n")
+        except Exception:
+            pass
+
+    def _on_new_tab(self):
+        """Open connection picker, then connect."""
+        if not _HAS_CONN_DIALOG:
+            QMessageBox.information(
+                self, "Tip",
+                "Double-click a connection in the sidebar to connect.\n"
+                "Use the + button in the sidebar to add new connections."
+            )
+            return
+        dlg = ConnectionDialog(self, self.connection_manager, self.credential_store)
+        if dlg.exec():
+            self.sidebar.refresh()
+
+    def _on_local_shell(self):
+        """Open a local shell tab."""
+        try:
+            session = self.ssh_handler.create_local_session()
+            self.terminal_panel.new_tab(session, None, "Local Shell")
+            self._update_status()
+        except Exception as exc:
+            QMessageBox.critical(self, "Local Shell Error", str(exc))
+
+    def _on_split_horizontal(self):
+        """Split the active pane horizontally."""
+        try:
+            pane = self.terminal_panel.active_pane
+            idx = self.terminal_panel.active_pane_index
+            if pane is not None:
+                self.terminal_panel.split_horizontal(pane, idx)
+        except Exception:
+            pass
+
+    def _on_split_vertical(self):
+        """Split the active pane vertically."""
+        try:
+            pane = self.terminal_panel.active_pane
+            idx = self.terminal_panel.active_pane_index
+            if pane is not None:
+                self.terminal_panel.split_vertical(pane, idx)
+        except Exception:
+            pass
+
+    def _on_unsplit(self):
+        """Remove all splits."""
+        try:
+            self.terminal_panel.unsplit()
+        except Exception:
+            pass
+
+    def _on_cluster(self, checked: bool):
+        """Toggle cluster mode or open cluster window."""
+        if not _HAS_CLUSTER:
+            self._act_cluster.setChecked(False)
+            QMessageBox.information(
+                self, "Not Available",
+                "Cluster mode window is not yet implemented."
+            )
+            return
+        if checked:
+            dlg = ClusterWindow(self, self.terminal_panel)
+            dlg.exec()
+            self._act_cluster.setChecked(False)
+
+    # ------------------------------------------------------------------
+    # Menu / toolbar handlers (misc)
+    # ------------------------------------------------------------------
+
+    def _on_toggle_sidebar(self):
+        visible = self.sidebar.isVisible()
+        self.sidebar.setVisible(not visible)
+        self.config["sidebar_visible"] = not visible
+
+    def _on_preferences(self):
+        if not _HAS_PREFS_DIALOG:
+            QMessageBox.information(
+                self, "Not Available",
+                "Preferences dialog is not yet implemented."
+            )
+            return
+        dlg = PreferencesDialog(self, self.config)
+        dlg.exec()
+
+    def _on_import(self):
+        QMessageBox.information(self, "Import", "Import functionality coming soon.")
+
+    def _on_export(self):
+        QMessageBox.information(self, "Export", "Export functionality coming soon.")
+
+    def _on_about(self):
+        QMessageBox.about(
+            self,
+            "About SSH Client Manager",
+            "<h3>SSH Client Manager</h3>"
+            "<p>A PySide6 SSH connection manager with split terminals, "
+            "cluster mode, and encrypted credential storage.</p>",
         )
-        dialog.connect("connection-saved", self._on_connection_saved)
-        dialog.present()
 
-    def _on_connection_saved(self, dialog, connection):
-        """Handle a connection being saved."""
-        self.sidebar.refresh()
-        self._set_status(f"Connection saved: {connection.name}")
+    def _on_terminal_title_changed(self, title: str):
+        self._status_title.setText(title)
 
-    # =====================================================================
-    # Terminal Panel Signal Handlers
-    # =====================================================================
+    # ------------------------------------------------------------------
+    # Status bar
+    # ------------------------------------------------------------------
 
-    def _on_tab_added(self, panel, terminal):
-        self._update_tab_count()
-        if self._cluster_window is not None:
-            self._cluster_window.refresh()
+    def _update_status(self):
+        count = len(self.connection_manager.get_connections())
+        self._status_conn_count.setText(f"Connections: {count}")
+        try:
+            terminals = self.terminal_panel.get_all_terminals()
+            n = len(terminals) if terminals else 0
+            self._status_conn_count.setText(f"Connections: {count}  |  Open terminals: {n}")
+        except Exception:
+            pass
 
-    def _on_tab_removed(self, panel, terminal):
-        self._update_tab_count()
-        if self._cluster_window is not None:
-            self._cluster_window.refresh()
-        # Clean up askpass if it was an SSH session
-        conn = panel.get_terminal_connection(terminal)
-        if conn:
-            self.ssh_handler.cleanup_askpass(conn.id)
+    # ------------------------------------------------------------------
+    # Persistence / close
+    # ------------------------------------------------------------------
 
-    def _on_active_terminal_changed(self, panel, terminal):
-        conn = panel.get_terminal_connection(terminal)
-        if conn:
-            self._set_status(f"{conn.name or conn.display_name()}")
-        else:
-            self._set_status("Local terminal")
+    def _restore_sidebar_width(self):
+        sidebar_visible = self.config.get("sidebar_visible", True)
+        self.sidebar.setVisible(bool(sidebar_visible))
 
-    def _on_terminal_title_changed(self, panel, terminal, title):
-        pass  # Tab label updates are handled in terminal_panel
+    def closeEvent(self, event: QCloseEvent):
+        """Save window state and optionally confirm close."""
+        if self.config.get("confirm_close_window", False):
+            try:
+                terminals = self.terminal_panel.get_all_terminals()
+            except Exception:
+                terminals = []
+            if terminals:
+                reply = QMessageBox.question(
+                    self,
+                    "Close SSH Client Manager",
+                    f"There are {len(terminals)} open terminal(s). Really close?",
+                    QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+                )
+                if reply != QMessageBox.StandardButton.Yes:
+                    event.ignore()
+                    return
 
-    # =====================================================================
-    # Keyboard Shortcuts
-    # =====================================================================
-
-    def _on_key_pressed(self, controller, keyval, keycode, state):
-        """Handle global keyboard shortcuts."""
-        ctrl = state & Gdk.ModifierType.CONTROL_MASK
-        shift = state & Gdk.ModifierType.SHIFT_MASK
-        alt = state & Gdk.ModifierType.ALT_MASK
-
-        # F9: Toggle sidebar
-        if keyval == Gdk.KEY_F9:
-            self._on_toggle_sidebar(None, None)
-            return True
-
-        # Ctrl+Shift shortcuts
-        if ctrl and shift:
-            if keyval == Gdk.KEY_T:
-                self.open_local_terminal()
-                return True
-            elif keyval == Gdk.KEY_N:
-                self._on_new_connection(None, None)
-                return True
-            elif keyval == Gdk.KEY_D:
-                self.terminal_panel.clone_current_tab()
-                return True
-            elif keyval == Gdk.KEY_H:
-                self.terminal_panel.split(Gtk.Orientation.HORIZONTAL)
-                return True
-            elif keyval == Gdk.KEY_V:
-                # Note: Ctrl+Shift+V is paste in the terminal.
-                # Use different shortcut for vertical split.
-                pass
-
-        # Ctrl+W: Close tab
-        if ctrl and keyval == Gdk.KEY_w:
-            self.terminal_panel.close_current_tab()
-            return True
-
-        # Ctrl+Tab / Ctrl+Shift+Tab: Next/Prev tab
-        if ctrl and keyval == Gdk.KEY_Tab:
-            if shift:
-                self.terminal_panel.prev_tab()
-            else:
-                self.terminal_panel.next_tab()
-            return True
-
-        # Ctrl+F: Search
-        if ctrl and keyval == Gdk.KEY_f:
-            self._on_search_terminal(None, None)
-            return True
-
-        # Alt+1-9: Switch to tab by number
-        if alt:
-            num = keyval - Gdk.KEY_1
-            if 0 <= num <= 8:
-                self.terminal_panel.switch_to_tab(num)
-                return True
-
-        return False
-
-    # =====================================================================
-    # Search
-    # =====================================================================
-
-    def _show_search_bar(self, terminal: TerminalWidget):
-        """Show an inline search bar for the terminal."""
-        # Check if we already have a search bar
-        search_bar = getattr(self, '_search_revealer', None)
-        if search_bar and search_bar.get_reveal_child():
-            search_bar.set_reveal_child(False)
-            return
-
-        # Create search bar
-        revealer = Gtk.Revealer()
-        revealer.set_transition_type(Gtk.RevealerTransitionType.SLIDE_DOWN)
-
-        hbox = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=4)
-        hbox.set_margin_start(8)
-        hbox.set_margin_end(8)
-        hbox.set_margin_top(4)
-        hbox.set_margin_bottom(4)
-
-        search_entry = Gtk.SearchEntry()
-        search_entry.set_hexpand(True)
-        search_entry.set_placeholder_text("Search terminal...")
-        hbox.append(search_entry)
-
-        btn_prev = Gtk.Button(icon_name="go-up-symbolic")
-        btn_prev.add_css_class("flat")
-        hbox.append(btn_prev)
-
-        btn_next = Gtk.Button(icon_name="go-down-symbolic")
-        btn_next.add_css_class("flat")
-        hbox.append(btn_next)
-
-        btn_close = Gtk.Button(icon_name="window-close-symbolic")
-        btn_close.add_css_class("flat")
-        btn_close.connect("clicked", lambda _: revealer.set_reveal_child(False))
-        hbox.append(btn_close)
-
-        # Connect search
-        search_entry.connect("search-changed",
-                             lambda e: terminal.search_text(e.get_text()))
-        btn_next.connect("clicked",
-                         lambda _: terminal.search_text(search_entry.get_text()))
-        btn_prev.connect("clicked",
-                         lambda _: terminal.search_text(search_entry.get_text(), backward=True))
-
-        revealer.set_child(hbox)
-
-        # Insert at top of terminal panel
-        if hasattr(self, '_search_revealer') and self._search_revealer.get_parent():
-            self._search_revealer.get_parent().remove(self._search_revealer)
-
-        self.terminal_panel.prepend(revealer)
-        self._search_revealer = revealer
-        revealer.set_reveal_child(True)
-        search_entry.grab_focus()
-
-    # =====================================================================
-    # Utilities
-    # =====================================================================
-
-    def _open_initial_terminal(self):
-        """Open an initial local terminal."""
-        self.open_local_terminal()
-        return False
-
-    def _set_status(self, text: str):
-        """Update the status bar text."""
-        self.status_label.set_text(text)
-
-    def _update_tab_count(self):
-        """Update the tab count display."""
-        count = self.terminal_panel.get_tab_count()
-        self.tab_count_label.set_text(f"{count} tab{'s' if count != 1 else ''}")
-
-    def _active_terminal_action(self, method_name: str, *args):
-        """Call a method on the active terminal."""
-        terminal = self.terminal_panel.focused_terminal
-        if terminal:
-            method = getattr(terminal, method_name, None)
-            if method:
-                method(*args)
-
-    def _on_close_request(self, window):
-        """Handle window close request."""
-        # Save window state
-        self.config.set("sidebar_width", self.paned.get_position())
-        alloc = self.get_allocation()
-        if alloc.width > 0:
-            self.config.set("window_width", alloc.width)
-        if alloc.height > 0:
-            self.config.set("window_height", alloc.height)
-        self.config.save()
-
-        # Clean up SSH handler
-        self.ssh_handler.cleanup_all()
-
-        return False  # Allow close
+        # Save window geometry
+        self.config["window_width"] = self.width()
+        self.config["window_height"] = self.height()
+        sizes = self._splitter.sizes()
+        if sizes:
+            self.config["sidebar_width"] = sizes[0]
+        self.config["sidebar_visible"] = self.sidebar.isVisible()
+        try:
+            self.config.save()
+        except Exception:
+            pass
+        event.accept()

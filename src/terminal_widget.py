@@ -1,308 +1,194 @@
 """
-VTE Terminal widget wrapper for GTK4.
+PySide6 terminal widget — QWebEngineView hosting xterm.js.
 
-Provides a configured VTE terminal with scrollbar, search, and connection
-lifecycle management.
+Each TerminalWidget owns a BaseSession (SSHSession or LocalShellSession).
+The WebSocket server lives inside the session; the view loads terminal.html
+with ?port=<ws_port> so xterm.js can connect.
 """
 
-import gi
-gi.require_version('Gtk', '4.0')
-gi.require_version('Vte', '3.91')
-
-from gi.repository import Gtk, Vte, GLib, Gdk, Pango, GObject
+import json
+import os
+import sys
+import urllib.parse
+from pathlib import Path
 from typing import Optional
 
-from .connection import Connection
+from PySide6.QtCore import Qt, QUrl, Signal, QTimer, QObject
+from PySide6.QtWebEngineWidgets import QWebEngineView
+from PySide6.QtWebEngineCore import QWebEngineSettings, QWebEnginePage
+from PySide6.QtWidgets import QWidget, QVBoxLayout, QMenu, QApplication
+
 from .config import Config
+from .connection import Connection
+from .ssh_session import BaseSession, SSHSession, LocalShellSession
+
+_ASSETS_DIR = (
+    Path(sys._MEIPASS) / "src" / "assets"
+    if getattr(sys, "frozen", False)
+    else Path(__file__).parent / "assets"
+)
 
 
-class TerminalWidget(Gtk.Box):
+class _SilentPage(QWebEnginePage):
+    """Suppress JS console messages from the terminal page."""
+
+    def javaScriptConsoleMessage(self, level, message, lineNumber, sourceId):
+        pass
+
+
+class TerminalWidget(QWidget):
     """
-    A VTE terminal with scrollbar and connection management.
+    A terminal widget backed by xterm.js in a QWebEngineView.
 
     Signals:
-        title-changed: Terminal title changed
-        child-exited: The shell/SSH process exited
-        connection-established: SSH connection appears alive
+        title_changed(str)   — terminal title updated
+        child_exited()       — SSH/process disconnected
     """
 
-    __gsignals__ = {
-        "title-changed": (GObject.SignalFlags.RUN_LAST, None, (str,)),
-        "child-exited": (GObject.SignalFlags.RUN_LAST, None, (int,)),
-    }
+    title_changed = Signal(str)
+    child_exited = Signal()
 
-    def __init__(self, config: Config, connection: Optional[Connection] = None):
-        super().__init__(orientation=Gtk.Orientation.HORIZONTAL)
-
+    def __init__(
+        self,
+        config: Config,
+        connection: Optional[Connection] = None,
+        parent: Optional[QWidget] = None,
+    ):
+        super().__init__(parent)
         self.config = config
         self.connection = connection
-        self._process_pid = -1
+        self._session: Optional[BaseSession] = None
+        self._connected = False
 
-        # Create VTE terminal
-        self.vte = Vte.Terminal()
-        self._configure_terminal()
+        layout = QVBoxLayout(self)
+        layout.setContentsMargins(0, 0, 0, 0)
+        layout.setSpacing(0)
 
-        # Create scrollbar
-        vadjustment = self.vte.get_vadjustment()
-        self.scrollbar = Gtk.Scrollbar(
-            orientation=Gtk.Orientation.VERTICAL,
-            adjustment=vadjustment
-        )
+        self._view = QWebEngineView(self)
+        page = _SilentPage(self._view)
+        self._view.setPage(page)
 
-        # Pack terminal + scrollbar
-        self.vte.set_hexpand(True)
-        self.vte.set_vexpand(True)
-        self.append(self.vte)
-        self.append(self.scrollbar)
+        # Allow local file access (needed for xterm.js loaded from disk)
+        settings = self._view.settings()
+        settings.setAttribute(QWebEngineSettings.WebAttribute.LocalContentCanAccessFileUrls, True)
+        settings.setAttribute(QWebEngineSettings.WebAttribute.LocalContentCanAccessRemoteUrls, True)
+        settings.setAttribute(QWebEngineSettings.WebAttribute.JavascriptEnabled, True)
 
-        # Connect signals
-        self.vte.connect("child-exited", self._on_child_exited)
-        self.vte.connect("window-title-changed", self._on_title_changed)
+        layout.addWidget(self._view)
 
-        # Focus handling
-        self.vte.set_focusable(True)
-        self.vte.set_can_focus(True)
+        self._view.titleChanged.connect(self._on_js_title)
 
-        # Key event controller for shortcuts
-        key_ctrl = Gtk.EventControllerKey()
-        key_ctrl.connect("key-pressed", self._on_key_pressed)
-        self.vte.add_controller(key_ctrl)
+    # ------------------------------------------------------------------
+    # Public API
+    # ------------------------------------------------------------------
 
-        # Right-click menu
-        self._setup_context_menu()
+    def start_session(self, session: BaseSession):
+        """Attach a session and load the terminal page."""
+        self._session = session
+        session.on_disconnected = self._on_disconnected
 
-    def _configure_terminal(self):
-        """Apply terminal configuration."""
-        cfg = self.config
+        session.start()
 
-        # Font
-        font_desc = Pango.FontDescription.from_string(
-            (self.connection and self.connection.font) or cfg["terminal_font"]
-        )
-        self.vte.set_font(font_desc)
+        # Give the WS server a moment to bind
+        QTimer.singleShot(200, self._load_terminal)
 
-        # Scrollback
-        self.vte.set_scrollback_lines(cfg["terminal_scrollback_lines"])
-
-        # Colors – use connection overrides only when they are set AND distinct
-        conn_bg = (self.connection and self.connection.bg_color) or ""
-        conn_fg = (self.connection and self.connection.fg_color) or ""
-        if conn_bg and conn_fg and conn_bg == conn_fg:
-            # Same fg/bg would make text invisible → ignore both
-            conn_bg = conn_fg = ""
-        bg_str = conn_bg or cfg["terminal_bg_color"]
-        fg_str = conn_fg or cfg["terminal_fg_color"]
-
-        bg = Gdk.RGBA()
-        bg.parse(bg_str)
-        fg = Gdk.RGBA()
-        fg.parse(fg_str)
-
-        # Parse palette
-        palette = []
-        for color_str in cfg["terminal_palette"]:
-            c = Gdk.RGBA()
-            c.parse(color_str)
-            palette.append(c)
-
-        self.vte.set_colors(fg, bg, palette)
-
-        # Cursor
-        cursor_map = {
-            "block": Vte.CursorShape.BLOCK,
-            "ibeam": Vte.CursorShape.IBEAM,
-            "underline": Vte.CursorShape.UNDERLINE,
-        }
-        shape = cursor_map.get(cfg["terminal_cursor_shape"], Vte.CursorShape.BLOCK)
-        self.vte.set_cursor_shape(shape)
-
-        # Misc
-        self.vte.set_allow_bold(cfg["terminal_allow_bold"])
-        self.vte.set_audible_bell(cfg["terminal_audible_bell"])
-
-        # Allow hyperlinks
-        try:
-            self.vte.set_allow_hyperlink(True)
-        except AttributeError:
-            pass  # Older VTE
-
-        # Word char exceptions for double-click selection
-        try:
-            self.vte.set_word_char_exceptions(cfg["word_separators"])
-        except AttributeError:
-            pass
-
-    def spawn_command(self, argv: list[str], env: list[str] = None,
-                      working_dir: str = None):
-        """
-        Spawn a process inside the terminal.
-
-        Args:
-            argv: Command and arguments, e.g. ["ssh", "user@host"]
-            env: Environment variables as "KEY=VALUE" strings
-            working_dir: Working directory (default: home)
-        """
-        import os
-        import shutil
-
-        if working_dir is None:
-            working_dir = str(GLib.get_home_dir())
-
-        # Build environment
-        if env is None:
-            env = [f"{k}={v}" for k, v in os.environ.items()]
-
-        # Resolve argv[0] to absolute path (GLib.SpawnFlags.DEFAULT
-        # requires an absolute path; this avoids needing SEARCH_PATH)
-        if argv and not os.path.isabs(argv[0]):
-            resolved = shutil.which(argv[0])
-            if resolved:
-                argv = [resolved] + argv[1:]
-
-        try:
-            self.vte.spawn_async(
-                Vte.PtyFlags.DEFAULT,       # pty_flags
-                working_dir,                # working_directory
-                argv,                       # argv
-                env,                        # envv
-                GLib.SpawnFlags.DEFAULT,    # spawn_flags
-                None,                       # child_setup
-                None,                       # child_setup_data
-                -1,                         # timeout (-1 = default)
-                None,                       # cancellable
-                self._on_spawn_complete,    # callback
-                None,                       # callback_data
-            )
-        except Exception as e:
-            print(f"Error spawning process: {e}")
-            import traceback
-            traceback.print_exc()
-
-    def _on_spawn_complete(self, terminal, pid, error, *user_data):
-        """Callback after spawn_async completes."""
-        if error:
-            print(f"Spawn error: {error}")
-            return
-        self._process_pid = pid
-
-    def feed_child(self, text: str):
-        """Send text to the terminal as if typed."""
-        try:
-            self.vte.feed_child(text.encode("utf-8"))
-        except TypeError:
-            # Some VTE versions need different args
-            data = text.encode("utf-8")
-            self.vte.feed_child(data, len(data))
-
-    def copy_clipboard(self):
-        """Copy selected text to clipboard."""
-        self.vte.copy_clipboard_format(Vte.Format.TEXT)
-
-    def paste_clipboard(self):
-        """Paste from clipboard."""
-        self.vte.paste_clipboard()
-
-    def select_all(self):
-        """Select all terminal content."""
-        self.vte.select_all()
-
-    def reset_terminal(self, clear: bool = False):
-        """Reset the terminal. If clear=True, also clear scrollback."""
-        self.vte.reset(True, clear)
-
-    def get_text(self) -> str:
-        """Get all visible terminal text."""
-        try:
-            text = self.vte.get_text_format(Vte.Format.TEXT)
-            if isinstance(text, tuple):
-                text = text[0]
-            return text if text else ""
-        except Exception:
-            return ""
-
-    def search_text(self, pattern: str, backward: bool = False):
-        """Search for text in the terminal."""
-        try:
-            regex = Vte.Regex.new_for_search(pattern, len(pattern.encode()), 0)
-            self.vte.search_set_regex(regex, 0)
-            if backward:
-                self.vte.search_find_previous()
-            else:
-                self.vte.search_find_next()
-        except Exception as e:
-            print(f"Search error: {e}")
-
-    def set_font_scale(self, scale: float):
-        """Set the terminal font scale."""
-        self.vte.set_font_scale(scale)
-
-    def get_title(self) -> str:
-        """Get the terminal window title."""
-        return self.vte.get_window_title() or ""
+    def send_text(self, text: str):
+        """Send text directly to the session (for post-login commands)."""
+        if self._session:
+            self._session.send_input(text)
 
     def grab_focus(self):
-        """Focus the VTE terminal."""
-        self.vte.grab_focus()
+        self._view.setFocus()
 
-    # --- Signal handlers ---
+    def is_connected(self) -> bool:
+        return self._connected
 
-    def _on_child_exited(self, terminal, status):
-        self.emit("child-exited", status)
+    def stop_session(self):
+        if self._session:
+            self._session.stop()
+            self._session = None
+        self._connected = False
 
-    def _on_title_changed(self, terminal):
-        title = self.get_title()
-        self.emit("title-changed", title)
+    # ------------------------------------------------------------------
+    # Internal
+    # ------------------------------------------------------------------
 
-    def _on_key_pressed(self, controller, keyval, keycode, state):
-        """Handle keyboard shortcuts."""
-        ctrl = state & Gdk.ModifierType.CONTROL_MASK
-        shift = state & Gdk.ModifierType.SHIFT_MASK
+    def _load_terminal(self):
+        if not self._session:
+            return
 
-        if ctrl and shift:
-            if keyval == Gdk.KEY_C:
-                self.copy_clipboard()
-                return True
-            elif keyval == Gdk.KEY_V:
-                self.paste_clipboard()
-                return True
+        cfg = self.config
+        conn = self.connection
 
-        return False
+        # Build font string (e.g. "Consolas, monospace" from "Consolas 12")
+        font_str = (conn.font if conn and conn.font else cfg["terminal_font"])
+        parts = font_str.rsplit(" ", 1)
+        font_family = parts[0] if len(parts) == 2 else font_str
+        try:
+            font_size = int(parts[1]) if len(parts) == 2 else 12
+        except ValueError:
+            font_size = 12
 
-    def _setup_context_menu(self):
-        """Set up right-click context menu."""
-        click = Gtk.GestureClick(button=3)  # Right click
-        click.connect("pressed", self._show_context_menu)
-        self.vte.add_controller(click)
+        bg = (conn.bg_color if conn and conn.bg_color else cfg["terminal_bg_color"])
+        fg = (conn.fg_color if conn and conn.fg_color else cfg["terminal_fg_color"])
+        palette = cfg["terminal_palette"]
+        cursor = cfg["terminal_cursor_shape"]
+        scrollback = cfg["terminal_scrollback_lines"]
 
-    def _show_context_menu(self, gesture, n_press, x, y):
-        """Show the terminal context menu."""
-        menu_model = self._build_context_menu()
-        popover = Gtk.PopoverMenu(menu_model=menu_model)
-        popover.set_parent(self.vte)
-        popover.set_pointing_to(Gdk.Rectangle(int(x), int(y), 1, 1))
+        params = {
+            "port": str(self._session.port),
+            "bg": bg,
+            "fg": fg,
+            "font_family": font_family,
+            "font_size": str(font_size),
+            "scrollback": str(scrollback),
+            "cursor": cursor,
+            "palette": urllib.parse.quote(json.dumps(palette)),
+        }
 
-        # We need to connect action handlers on the widget
-        popover.popup()
+        query = "&".join(f"{k}={urllib.parse.quote(str(v), safe='')}"
+                         for k, v in params.items()
+                         if k != "palette")
+        query += f"&palette={params['palette']}"
 
-    def _build_context_menu(self):
-        """Build the context menu model."""
-        from gi.repository import Gio
-        menu = Gio.Menu()
+        html_path = _ASSETS_DIR / "terminal.html"
+        base_url = QUrl.fromLocalFile(str(_ASSETS_DIR) + "/")
+        url = QUrl(f"file:///{html_path.as_posix()}?{query}")
 
-        section1 = Gio.Menu()
-        section1.append("Copy", "term.copy")
-        section1.append("Paste", "term.paste")
-        section1.append("Select All", "term.select-all")
-        menu.append_section(None, section1)
+        self._view.load(url)
+        self._connected = True
 
-        section2 = Gio.Menu()
-        section2.append("Reset Terminal", "term.reset")
-        section2.append("Clear Scrollback", "term.clear")
-        menu.append_section(None, section2)
+    def _on_js_title(self, title: str):
+        if title and title != "terminal.html":
+            self.title_changed.emit(title)
 
-        section3 = Gio.Menu()
-        section3.append("Split Horizontally", "panel.split-h")
-        section3.append("Split Vertically", "panel.split-v")
-        menu.append_section(None, section3)
+    def _on_disconnected(self):
+        self._connected = False
+        self.child_exited.emit()
 
-        return menu
+    # ------------------------------------------------------------------
+    # Context menu
+    # ------------------------------------------------------------------
+
+    def contextMenuEvent(self, event):
+        menu = QMenu(self)
+        menu.addAction("Copy", self._copy)
+        menu.addAction("Paste", self._paste)
+        menu.addSeparator()
+        menu.addAction("Select All", self._select_all)
+        menu.exec(event.globalPos())
+
+    def _copy(self):
+        self._view.page().runJavaScript(
+            "term.getSelection()",
+            lambda sel: QApplication.clipboard().setText(sel) if sel else None
+        )
+
+    def _paste(self):
+        text = QApplication.clipboard().text()
+        if text and self._session:
+            self._session.send_input(text)
+
+    def _select_all(self):
+        self._view.page().runJavaScript("term.selectAll()")
+

@@ -1,236 +1,201 @@
 """
-SSH process handling with SSH_ASKPASS-based credential injection.
+SSH connection parameter parsing and session factory.
 
-No expect commands are used. Instead, credentials are passed via a
-temporary SSH_ASKPASS script that outputs the appropriate credential
-when SSH requests it.
+Credentials are handled by paramiko directly (no bash scripts, no SSH_ASKPASS).
+Session objects (SSHSession / LocalShellSession) manage the actual I/O.
 """
 
 import os
-import stat
-import tempfile
+import platform
+import shlex
 import shutil
-from pathlib import Path
 from typing import Optional
 
 from .connection import Connection
 from .credential_store import CredentialStore
+from .ssh_session import SSHSession, LocalShellSession
 
 
 class SSHHandler:
     """
-    Builds SSH commands and manages credential injection via SSH_ASKPASS.
-
-    The askpass mechanism works by:
-    1. Creating a temporary shell script that echoes the stored password/passphrase
-    2. Setting SSH_ASKPASS to point to this script
-    3. Setting SSH_ASKPASS_REQUIRE=force so SSH uses it even with a TTY
-    4. Cleaning up the script after a delay
+    Parses SSH connection parameters and creates session objects.
     """
 
     def __init__(self, credential_store: CredentialStore):
         self._cred_store = credential_store
-        self._askpass_scripts: dict[str, str] = {}  # connection_id -> script path
-        self._askpass_dir = Path(tempfile.mkdtemp(prefix="ssh-cm-askpass-"))
-        os.chmod(str(self._askpass_dir), stat.S_IRWXU)  # 0700
+
+    # ------------------------------------------------------------------
+    # Session factory
+    # ------------------------------------------------------------------
+
+    def create_session(self, connection: Connection) -> SSHSession:
+        """
+        Build an SSHSession from a Connection, injecting stored credentials.
+        """
+        params = self._parse_ssh_params(connection)
+
+        return SSHSession(
+            hostname=params["hostname"],
+            port=params["port"],
+            username=params["username"],
+            password=self._cred_store.get_password(connection.id) or "",
+            key_file=params["key_file"],
+            passphrase1=self._cred_store.get_passphrase1(connection.id) or "",
+            passphrase2=self._cred_store.get_passphrase2(connection.id) or "",
+            term_type=connection.term_type or "xterm-256color",
+            tunnels=params["tunnels"],
+        )
+
+    def create_local_session(self) -> LocalShellSession:
+        """Create a local shell session."""
+        return LocalShellSession()
+
+    # ------------------------------------------------------------------
+    # Command parsing
+    # ------------------------------------------------------------------
 
     def build_ssh_command(self, connection: Connection) -> list[str]:
         """
-        Build the SSH command line from the connection's command field.
-
-        The command field contains the full SSH command as typed in a shell,
-        potentially spanning multiple lines.  We join lines and split with
-        shlex so that quoted arguments are preserved.
-
-        Returns: list of command arguments, e.g. ["ssh", "-p", "22", "user@host"]
+        Parse the raw command string into argv (kept for display / advanced use).
         """
-        import shlex
-
         if not connection.command:
             return ["ssh"]
-
-        # Join multi-line commands and split properly
         cmd_str = " ".join(connection.command.strip().splitlines())
         try:
             return shlex.split(cmd_str)
         except ValueError:
-            # Fallback: naive split
             return cmd_str.split()
 
-    def build_environment(self, connection: Connection) -> list[str]:
+    def _parse_ssh_params(self, connection: Connection) -> dict:
         """
-        Build environment variables for the SSH process.
+        Extract hostname, port, username, key file and port-forwarding rules
+        from the command string.
 
-        Returns: list of "KEY=VALUE" strings suitable for VTE spawn.
+        Supports common ssh flags:
+          -p PORT   -i IDENTITY_FILE   -L [local_port:remote_host:remote_port]
+          -R [remote_port:local_host:local_port]   -D [local_port]
+          user@host   host
         """
-        env = os.environ.copy()
+        argv = self.build_ssh_command(connection)
 
-        # Set TERM
-        if connection.term_type:
-            env["TERM"] = connection.term_type
-        elif "TERM" not in env:
-            env["TERM"] = "xterm-256color"
+        params = {
+            "hostname": "",
+            "port": 22,
+            "username": "",
+            "key_file": "",
+            "tunnels": [],   # list of dicts: {type, local_port, remote_host, remote_port}
+        }
 
-        # Set up SSH_ASKPASS for credential injection
-        askpass_script = self._create_askpass_script(connection)
-        if askpass_script:
-            env["SSH_ASKPASS"] = askpass_script
-            env["SSH_ASKPASS_REQUIRE"] = "force"
-            # DISPLAY must be set for SSH_ASKPASS to work
-            if "DISPLAY" not in env:
-                env["DISPLAY"] = ":0"
+        i = 1  # skip "ssh"
+        positional = []
+        while i < len(argv):
+            arg = argv[i]
+            if arg in ("-p",) and i + 1 < len(argv):
+                try:
+                    params["port"] = int(argv[i + 1])
+                except ValueError:
+                    pass
+                i += 2
+            elif arg in ("-i",) and i + 1 < len(argv):
+                params["key_file"] = argv[i + 1]
+                i += 2
+            elif arg in ("-l",) and i + 1 < len(argv):
+                params["username"] = argv[i + 1]
+                i += 2
+            elif arg == "-L" and i + 1 < len(argv):
+                t = self._parse_forward_spec("L", argv[i + 1])
+                if t:
+                    params["tunnels"].append(t)
+                i += 2
+            elif arg == "-R" and i + 1 < len(argv):
+                t = self._parse_forward_spec("R", argv[i + 1])
+                if t:
+                    params["tunnels"].append(t)
+                i += 2
+            elif arg == "-D" and i + 1 < len(argv):
+                try:
+                    params["tunnels"].append({
+                        "type": "D",
+                        "local_port": int(argv[i + 1]),
+                        "remote_host": "",
+                        "remote_port": 0,
+                    })
+                except ValueError:
+                    pass
+                i += 2
+            elif arg.startswith("-"):
+                # Skip other flags with values (single char flags that take a value)
+                if len(arg) == 2 and arg[1] in "bceFIJmOoQSw" and i + 1 < len(argv):
+                    i += 2
+                else:
+                    i += 1
+            else:
+                positional.append(arg)
+                i += 1
 
-            # If a password is stored, disable SSH agent so SSH_ASKPASS is used
-            password = self._cred_store.get_password(connection.id)
-            if password:
-                env.pop("SSH_AUTH_SOCK", None)
+        # Last positional is [user@]host
+        if positional:
+            dest = positional[-1]
+            if "@" in dest:
+                params["username"], params["hostname"] = dest.rsplit("@", 1)
+            else:
+                params["hostname"] = dest
 
-        return [f"{k}={v}" for k, v in env.items()]
+        return params
 
-    def _create_askpass_script(self, connection: Connection) -> Optional[str]:
+    @staticmethod
+    def _parse_forward_spec(ttype: str, spec: str) -> Optional[dict]:
         """
-        Create a temporary SSH_ASKPASS script for the connection.
-
-        SSH invokes this script once per prompt, passing the prompt text
-        as $1.  The script inspects the prompt to decide what to return:
-
-        * Prompt contains "passphrase" → key passphrase is needed.
-          - 1st passphrase prompt  → Passphrase 1
-          - 2nd passphrase prompt  → Passphrase 2  (if set)
-          - If no passphrase stored → exit 1  (SSH falls back to interactive)
-        * Prompt contains "password"  → login password is needed.
-          - Return Password if stored, otherwise exit 1.
-        * Any other prompt           → exit 1  (unknown prompt, don't guess).
-
-        Because SSH spawns a **new process** for each prompt, we persist a
-        counter in a temp file keyed to the connection ID so that successive
-        passphrase prompts see an incrementing count.
+        Parse a port-forward spec string: [bind_addr:]port:host:hostport
+        Returns None if the spec is malformed.
         """
-        password = self._cred_store.get_password(connection.id)
-        passphrase1 = self._cred_store.get_passphrase1(connection.id)
-        passphrase2 = self._cred_store.get_passphrase2(connection.id)
-
-        if not password and not passphrase1 and not passphrase2:
-            return None
-
-        # Counter file uses connection-id prefix so it survives across
-        # the separate askpass process invocations for one SSH session.
-        counter_file = f"/tmp/.ssh-cm-askpass-counter-{connection.id[:8]}"
-
-        # Build the askpass script — always branch on prompt type
-        script_lines = [
-            "#!/bin/bash",
-            'PROMPT="$1"',
-            f'COUNTER_FILE="{counter_file}"',
-            '',
-            '# --- passphrase prompt ---',
-            'if echo "$PROMPT" | grep -qi "passphrase"; then',
-        ]
-
-        if passphrase1 and passphrase2:
-            script_lines.extend([
-                '    COUNT=$(cat "$COUNTER_FILE" 2>/dev/null || echo 0)',
-                '    COUNT=$((COUNT + 1))',
-                '    echo "$COUNT" > "$COUNTER_FILE"',
-                '    if [ "$COUNT" -le 1 ]; then',
-                f'        echo "{self._escape_for_shell(passphrase1)}"',
-                '    else',
-                f'        echo "{self._escape_for_shell(passphrase2)}"',
-                '    fi',
-            ])
-        elif passphrase1:
-            script_lines.append(
-                f'    echo "{self._escape_for_shell(passphrase1)}"')
-        elif passphrase2:
-            script_lines.append(
-                f'    echo "{self._escape_for_shell(passphrase2)}"')
-        else:
-            # No passphrase stored → fail so SSH falls back to interactive
-            script_lines.append('    exit 1')
-
-        # --- password prompt ---
-        script_lines.append('elif echo "$PROMPT" | grep -qi "password"; then')
-        if password:
-            script_lines.append(
-                f'    echo "{self._escape_for_shell(password)}"')
-        else:
-            script_lines.append('    exit 1')
-
-        # --- anything else → don't guess ---
-        script_lines.extend([
-            'else',
-            '    exit 1',
-            'fi',
-        ])
-
-        script_content = "\n".join(script_lines) + "\n"
-
-        # Write to temp file with restricted permissions
-        script_path = os.path.join(
-            str(self._askpass_dir),
-            f"askpass-{connection.id[:8]}"
-        )
-
-        fd = os.open(script_path, os.O_WRONLY | os.O_CREAT | os.O_TRUNC,
-                      stat.S_IRWXU)  # 0700
-        with os.fdopen(fd, "w") as f:
-            f.write(script_content)
-
-        self._askpass_scripts[connection.id] = script_path
-        return script_path
-
-    def cleanup_askpass(self, connection_id: str):
-        """Remove the askpass script and counter file for a connection."""
-        if connection_id in self._askpass_scripts:
-            script_path = self._askpass_scripts.pop(connection_id)
-            try:
-                os.unlink(script_path)
-            except OSError:
-                pass
-        # Remove passphrase counter file
-        counter = f"/tmp/.ssh-cm-askpass-counter-{connection_id[:8]}"
+        parts = spec.split(":")
         try:
-            os.unlink(counter)
-        except OSError:
+            if ttype == "L":
+                # local_port:remote_host:remote_port
+                # or bind_addr:local_port:remote_host:remote_port
+                if len(parts) == 3:
+                    return {"type": "L", "local_port": int(parts[0]),
+                            "remote_host": parts[1], "remote_port": int(parts[2])}
+                if len(parts) == 4:
+                    return {"type": "L", "local_port": int(parts[1]),
+                            "remote_host": parts[2], "remote_port": int(parts[3])}
+            elif ttype == "R":
+                if len(parts) == 3:
+                    return {"type": "R", "local_port": int(parts[0]),
+                            "remote_host": parts[1], "remote_port": int(parts[2])}
+                if len(parts) == 4:
+                    return {"type": "R", "local_port": int(parts[1]),
+                            "remote_host": parts[2], "remote_port": int(parts[3])}
+        except (ValueError, IndexError):
             pass
+        return None
 
-    def cleanup_all(self):
-        """Remove all askpass scripts and the temp directory."""
-        for script_path in self._askpass_scripts.values():
-            try:
-                os.unlink(script_path)
-            except OSError:
-                pass
-        self._askpass_scripts.clear()
-        try:
-            shutil.rmtree(str(self._askpass_dir), ignore_errors=True)
-        except OSError:
-            pass
+    # ------------------------------------------------------------------
+    # Post-login commands
+    # ------------------------------------------------------------------
 
     def get_post_login_commands(self, connection: Connection) -> list[str]:
         """
-        Parse post-login commands from the connection config.
-
-        Supports delay syntax: ##D=1000 (delay 1000ms before next command)
-        Returns list of (command_or_delay) strings.
+        Parse post-login commands. Supports ##D=<ms> delay markers.
+        Returns list of command strings (delay markers preserved as-is).
         """
         if not connection.commands:
             return []
+        return [
+            line.strip()
+            for line in connection.commands.strip().split("\n")
+            if line.strip()
+        ]
 
-        commands = []
-        for line in connection.commands.strip().split("\n"):
-            line = line.strip()
-            if line:
-                commands.append(line)
-        return commands
-
-    @staticmethod
-    def _escape_for_shell(s: str) -> str:
-        """Escape a string for safe inclusion in a shell double-quoted string."""
-        return s.replace("\\", "\\\\").replace('"', '\\"').replace("$", "\\$").replace("`", "\\`")
+    # ------------------------------------------------------------------
+    # Helpers
+    # ------------------------------------------------------------------
 
     @staticmethod
     def get_local_shell_command() -> list[str]:
-        """Get the command for opening a local shell."""
-        shell = os.environ.get("SHELL", "/bin/bash")
-        return [shell]
+        """Get the local shell command for the current OS."""
+        if platform.system() == "Windows":
+            ps = shutil.which("pwsh") or shutil.which("powershell")
+            return [ps, "-NoLogo"] if ps else ["cmd.exe"]
+        return [os.environ.get("SHELL", "/bin/bash")]

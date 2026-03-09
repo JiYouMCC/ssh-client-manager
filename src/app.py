@@ -1,143 +1,449 @@
 """
-SSH Client Manager Application.
+SSH Client Manager Application entry point.
 
-A modern GTK4/libadwaita SSH connection manager that combines
-the best features of gnome-connection-manager and sshpilot:
-- Split terminals (horizontal/vertical) from GCM
-- Modern GTK4/Adw UI
-- Encrypted credential storage (no expect)
-- SSH_ASKPASS for password injection
+Creates the QApplication, applies a light (Catppuccin Latte) chrome stylesheet
+with a dark terminal area, and launches the main window.
 """
 
-import gi
-gi.require_version('Gtk', '4.0')
-gi.require_version('Adw', '1')
-gi.require_version('Vte', '3.91')
+from __future__ import annotations
 
 import sys
-from gi.repository import Gtk, Adw, Gio, GLib
+
+from PySide6.QtWidgets import QApplication
+from PySide6.QtCore import Qt
 
 from .config import Config
 from .window import MainWindow
 
 
-APP_ID = "io.github.ssh-client-manager"
-CSS_DATA = """
-/* Tab styling */
-.disconnected-tab {
-    text-decoration: line-through;
-    opacity: 0.5;
+# ---------------------------------------------------------------------------
+# Catppuccin Latte light stylesheet (QSS)
+# Chrome (menus, toolbar, sidebar, dialogs) is light.
+# The terminal itself is a QWebEngineView whose content is controlled by
+# xterm.js / terminal.html — it keeps its own dark Mocha palette regardless.
+# ---------------------------------------------------------------------------
+# Palette:
+#   base     #eff1f5   mantle   #e6e9ef   crust    #dce0e8
+#   surface0 #ccd0da   surface1 #bcc0cc   overlay1 #8c8fa1
+#   text     #4c4f69   subtext1 #5c5f77
+#   accent   #1e66f5   green    #40a02b   red      #d20f39
+# ---------------------------------------------------------------------------
+_LIGHT_QSS = """
+/* ── Base ──────────────────────────────────────────────────────────────── */
+QMainWindow, QDialog {
+    background-color: #eff1f5;
+    color: #4c4f69;
 }
 
-.cluster-selected {
-    background-color: alpha(@accent_bg_color, 0.3);
+QWidget {
+    background-color: #eff1f5;
+    color: #4c4f69;
+    font-family: "Segoe UI";
+    font-size: 10pt;
+    selection-background-color: #bcc0cc;
+    selection-color: #4c4f69;
+}
+
+/* ── Menu bar ───────────────────────────────────────────────────────────── */
+QMenuBar {
+    background-color: #e6e9ef;
+    color: #4c4f69;
+    border-bottom: 1px solid #ccd0da;
+    font-family: "Segoe UI";
+    font-size: 10pt;
+}
+
+QMenuBar::item {
+    padding: 5px 10px;
     border-radius: 4px;
 }
 
-/* Sidebar styling */
-.sidebar {
-    background-color: mix(@window_bg_color, @view_bg_color, 0.5);
+QMenuBar::item:selected {
+    background-color: #ccd0da;
 }
 
-/* Status bar */
-.status-bar {
-    font-size: 0.85em;
-    padding: 2px 8px;
+QMenu {
+    background-color: #eff1f5;
+    color: #4c4f69;
+    border: 1px solid #bcc0cc;
+    border-radius: 6px;
+    padding: 4px;
+    font-family: "Segoe UI";
+    font-size: 10pt;
 }
 
-/* Terminal panel split handle */
-paned > separator {
-    min-width: 4px;
-    min-height: 4px;
+QMenu::item {
+    padding: 5px 28px 5px 10px;
+    border-radius: 4px;
 }
 
-/* Notebook tabs */
-notebook > header > tabs > tab {
+QMenu::item:selected {
+    background-color: #ccd0da;
+}
+
+QMenu::separator {
+    height: 1px;
+    background-color: #ccd0da;
+    margin: 4px 8px;
+}
+
+/* ── Toolbar ────────────────────────────────────────────────────────────── */
+QToolBar {
+    background-color: #e6e9ef;
+    border-bottom: 1px solid #ccd0da;
+    spacing: 2px;
     padding: 2px 4px;
-    min-height: 24px;
 }
 
-notebook > header > tabs > tab:checked {
+QToolBar::separator {
+    width: 1px;
+    background-color: #bcc0cc;
+    margin: 4px 2px;
+}
+
+QToolButton {
+    background-color: transparent;
+    color: #4c4f69;
+    border: none;
+    border-radius: 4px;
+    padding: 4px 8px;
+    font-family: "Segoe UI";
+    font-size: 10pt;
+}
+
+QToolButton:hover {
+    background-color: #ccd0da;
+}
+
+QToolButton:pressed, QToolButton:checked {
+    background-color: #bcc0cc;
+}
+
+/* ── Buttons ────────────────────────────────────────────────────────────── */
+QPushButton {
+    background-color: #e6e9ef;
+    color: #4c4f69;
+    border: 1px solid #bcc0cc;
+    border-radius: 6px;
+    padding: 4px 12px;
+    min-width: 64px;
+}
+
+QPushButton:hover {
+    background-color: #ccd0da;
+    border-color: #1e66f5;
+}
+
+QPushButton:pressed {
+    background-color: #bcc0cc;
+}
+
+QPushButton:default {
+    border-color: #1e66f5;
+    color: #1e66f5;
+}
+
+/* ── Line edit ──────────────────────────────────────────────────────────── */
+QLineEdit {
+    background-color: #ffffff;
+    color: #4c4f69;
+    border: 1px solid #bcc0cc;
+    border-radius: 6px;
+    padding: 4px 8px;
+}
+
+QLineEdit:focus {
+    border-color: #1e66f5;
+}
+
+QLineEdit:disabled {
+    color: #8c8fa1;
+    background-color: #e6e9ef;
+}
+
+/* ── Text edit ──────────────────────────────────────────────────────────── */
+QTextEdit {
+    background-color: #ffffff;
+    color: #4c4f69;
+    border: 1px solid #bcc0cc;
+    border-radius: 6px;
+    padding: 4px;
+}
+
+QTextEdit:focus {
+    border-color: #1e66f5;
+}
+
+/* ── Sidebar tree ───────────────────────────────────────────────────────── */
+QTreeWidget {
+    background-color: #e6e9ef;
+    color: #4c4f69;
+    border: none;
+    outline: none;
+}
+
+QTreeWidget::item {
+    padding: 3px 4px;
+    border-radius: 4px;
+}
+
+QTreeWidget::item:selected {
+    background-color: #bcc0cc;
+    color: #4c4f69;
+}
+
+QTreeWidget::item:hover {
+    background-color: #ccd0da;
+}
+
+QTreeWidget::branch {
+    background-color: #e6e9ef;
+}
+
+/* ── Tab widget ─────────────────────────────────────────────────────────── */
+QTabWidget::pane {
+    border: none;
+    background-color: #eff1f5;
+}
+
+QTabBar {
+    background-color: #e6e9ef;
+}
+
+QTabBar::tab {
+    background-color: #e6e9ef;
+    color: #5c5f77;
+    padding: 4px 12px;
+    border: none;
+    border-bottom: 2px solid transparent;
+    min-width: 80px;
+}
+
+QTabBar::tab:selected {
+    color: #4c4f69;
+    border-bottom-color: #1e66f5;
+    background-color: #eff1f5;
+}
+
+QTabBar::tab:hover:!selected {
+    background-color: #ccd0da;
+    color: #4c4f69;
+}
+
+/* ── Splitter ───────────────────────────────────────────────────────────── */
+QSplitter::handle {
+    background-color: #ccd0da;
+}
+
+QSplitter::handle:horizontal {
+    width: 3px;
+}
+
+QSplitter::handle:vertical {
+    height: 3px;
+}
+
+QSplitter::handle:hover {
+    background-color: #1e66f5;
+}
+
+/* ── Status bar ─────────────────────────────────────────────────────────── */
+QStatusBar {
+    background-color: #e6e9ef;
+    color: #5c5f77;
+    border-top: 1px solid #ccd0da;
+    font-size: 11px;
+}
+
+QStatusBar::item {
+    border: none;
+}
+
+/* ── Scroll bars ────────────────────────────────────────────────────────── */
+QScrollBar:vertical {
+    background-color: #e6e9ef;
+    width: 10px;
+    margin: 0;
+    border-radius: 5px;
+}
+
+QScrollBar::handle:vertical {
+    background-color: #bcc0cc;
+    min-height: 24px;
+    border-radius: 5px;
+}
+
+QScrollBar::handle:vertical:hover {
+    background-color: #8c8fa1;
+}
+
+QScrollBar::add-line:vertical, QScrollBar::sub-line:vertical {
+    height: 0;
+}
+
+QScrollBar:horizontal {
+    background-color: #e6e9ef;
+    height: 10px;
+    margin: 0;
+    border-radius: 5px;
+}
+
+QScrollBar::handle:horizontal {
+    background-color: #bcc0cc;
+    min-width: 24px;
+    border-radius: 5px;
+}
+
+QScrollBar::handle:horizontal:hover {
+    background-color: #8c8fa1;
+}
+
+QScrollBar::add-line:horizontal, QScrollBar::sub-line:horizontal {
+    width: 0;
+}
+
+/* ── Combo box ──────────────────────────────────────────────────────────── */
+QComboBox {
+    background-color: #ffffff;
+    color: #4c4f69;
+    border: 1px solid #bcc0cc;
+    border-radius: 6px;
+    padding: 3px 8px;
+}
+
+QComboBox:hover {
+    border-color: #1e66f5;
+}
+
+QComboBox QAbstractItemView {
+    background-color: #eff1f5;
+    color: #4c4f69;
+    selection-background-color: #ccd0da;
+    border: 1px solid #bcc0cc;
+}
+
+/* ── Table widget ───────────────────────────────────────────────────────── */
+QTableWidget {
+    background-color: #ffffff;
+    color: #4c4f69;
+    border: 1px solid #ccd0da;
+    border-radius: 4px;
+    gridline-color: #e6e9ef;
+}
+
+QHeaderView::section {
+    background-color: #e6e9ef;
+    color: #5c5f77;
+    border: none;
+    border-bottom: 1px solid #ccd0da;
+    padding: 4px 8px;
     font-weight: bold;
 }
 
-/* Search bar */
-.search-bar {
-    background-color: @headerbar_bg_color;
-    border-bottom: 1px solid @borders;
+QTableWidget::item:selected {
+    background-color: #ccd0da;
+    color: #4c4f69;
 }
 
-/* Cluster bar */
-.cluster-bar {
-    background-color: alpha(@accent_bg_color, 0.1);
-    border-bottom: 1px solid @accent_bg_color;
+/* ── Labels ─────────────────────────────────────────────────────────────── */
+QLabel {
+    color: #4c4f69;
+    background-color: transparent;
+}
+
+/* ── Group box ──────────────────────────────────────────────────────────── */
+QGroupBox {
+    color: #1e66f5;
+    border: 1px solid #bcc0cc;
+    border-radius: 6px;
+    margin-top: 8px;
+    padding-top: 8px;
+}
+
+QGroupBox::title {
+    subcontrol-origin: margin;
+    subcontrol-position: top left;
+    padding: 0 4px;
+    color: #1e66f5;
+}
+
+/* ── Check / radio ──────────────────────────────────────────────────────── */
+QCheckBox, QRadioButton {
+    color: #4c4f69;
+    spacing: 6px;
+}
+
+QCheckBox::indicator, QRadioButton::indicator {
+    width: 14px;
+    height: 14px;
+    border: 1px solid #bcc0cc;
+    border-radius: 3px;
+    background-color: #ffffff;
+}
+
+QCheckBox::indicator:checked {
+    background-color: #1e66f5;
+    border-color: #1e66f5;
+}
+
+QRadioButton::indicator {
+    border-radius: 7px;
+}
+
+QRadioButton::indicator:checked {
+    background-color: #1e66f5;
+    border-color: #1e66f5;
+}
+
+/* ── Spin box ───────────────────────────────────────────────────────────── */
+QSpinBox, QDoubleSpinBox {
+    background-color: #ffffff;
+    color: #4c4f69;
+    border: 1px solid #bcc0cc;
+    border-radius: 6px;
+    padding: 3px 6px;
+}
+
+/* ── Tool tip ───────────────────────────────────────────────────────────── */
+QToolTip {
+    background-color: #e6e9ef;
+    color: #4c4f69;
+    border: 1px solid #bcc0cc;
+    border-radius: 4px;
+    padding: 3px 6px;
 }
 """
 
 
-class SSHClientApp(Adw.Application):
-    """The main application class."""
+# ---------------------------------------------------------------------------
+# Entry point
+# ---------------------------------------------------------------------------
 
-    def __init__(self):
-        super().__init__(
-            application_id=APP_ID,
-            flags=Gio.ApplicationFlags.DEFAULT_FLAGS,
-        )
+def main() -> int:
+    """
+    Application entry point.
 
-        self.config = Config()
-        self.window = None
+    Creates the QApplication, sets up styling, creates Config and MainWindow,
+    shows the window, and enters the Qt event loop.
 
-        # Set application name
-        GLib.set_application_name("SSH Client Manager")
-        GLib.set_prgname("ssh-client-manager")
+    Returns:
+        Exit code from app.exec()
+    """
+    app = QApplication(sys.argv)
+    app.setApplicationName("SSH Client Manager")
+    app.setOrganizationName("ssh-client-manager")
+    app.setApplicationDisplayName("SSH Client Manager")
 
-    def do_startup(self):
-        """Application startup: load CSS, register shortcuts."""
-        Adw.Application.do_startup(self)
-        self._load_css()
-        self._register_shortcuts()
+    # Windows-comfortable font: Segoe UI 10pt normal weight
+    from PySide6.QtGui import QFont
+    font = QFont("Segoe UI", 10)
+    font.setWeight(QFont.Weight.Normal)
+    app.setFont(font)
 
-    def do_activate(self):
-        """Application activated: show main window."""
-        if not self.window:
-            self.window = MainWindow(self, self.config)
+    app.setStyleSheet(_LIGHT_QSS)
 
-        self.window.present()
+    config = Config()
+    window = MainWindow(config)
+    window.show()
 
-    def _load_css(self):
-        """Load application CSS."""
-        from gi.repository import Gdk
-
-        css_provider = Gtk.CssProvider()
-        css_provider.load_from_data(CSS_DATA.encode())
-
-        display = Gdk.Display.get_default()
-        if display:
-            Gtk.StyleContext.add_provider_for_display(
-                display, css_provider,
-                Gtk.STYLE_PROVIDER_PRIORITY_APPLICATION
-            )
-
-    def _register_shortcuts(self):
-        """Register global keyboard shortcuts."""
-        shortcuts = {
-            "win.new-local": ["<Ctrl><Shift>t"],
-            "win.new-connection": ["<Ctrl><Shift>n"],
-            "win.close-tab": ["<Ctrl>w"],
-            "win.next-tab": ["<Ctrl>Tab"],
-            "win.prev-tab": ["<Ctrl><Shift>Tab"],
-            "win.preferences": ["<Ctrl>comma"],
-            "win.toggle-sidebar": ["F9"],
-            "win.search-terminal": ["<Ctrl>f"],
-            "win.split-h": ["<Ctrl><Shift>h"],
-            "win.quit": ["<Ctrl>q"],
-        }
-
-        for action, accels in shortcuts.items():
-            self.set_accels_for_action(action, accels)
-
-
-def main():
-    """Entry point for the application."""
-    app = SSHClientApp()
-    return app.run(sys.argv)
+    return app.exec()

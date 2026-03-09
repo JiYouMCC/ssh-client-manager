@@ -1,243 +1,153 @@
 """
-Cluster mode window – send commands to selected terminals.
+Cluster mode window (PySide6).
 
-A standalone popup window (like gnome-connection-manager's Wcluster)
-that lists all open terminals with checkboxes.  The user picks which
-terminals should receive the command, types in the command entry, and
-presses Enter (or the Send button).
-
+Sends the same command to multiple selected terminals simultaneously.
 Features:
-    - All / None / Invert quick-select buttons
-    - Checked terminals get a visual highlight on their tab label
-    - Command history navigable with Ctrl+Up / Ctrl+Down
-    - Close button or window close clears all highlights
+  - Checkbox list of all open terminals
+  - All / None / Invert quick-select
+  - Command history (Ctrl+Up / Ctrl+Down)
+  - Non-modal so the user can interact with terminals while broadcasting
 """
 
-import gi
-gi.require_version('Gtk', '4.0')
+from PySide6.QtCore import Qt
+from PySide6.QtWidgets import (
+    QDialog, QVBoxLayout, QHBoxLayout, QPushButton, QLineEdit,
+    QLabel, QScrollArea, QWidget, QCheckBox, QFrame,
+)
+from PySide6.QtGui import QKeyEvent, QKeySequence, QShortcut
 
-from gi.repository import Gtk, Gdk, GLib
 
+class ClusterWindow(QDialog):
+    """Non-modal window for broadcasting commands to multiple terminals."""
 
-class ClusterWindow(Gtk.Window):
-    """Popup window for cluster-mode command sending."""
+    def __init__(self, parent, terminal_panel):
+        super().__init__(parent)
+        self.setWindowTitle("Cluster – Send to Terminals")
+        self.setWindowModality(Qt.WindowModality.NonModal)
+        self.resize(460, 400)
 
-    def __init__(self, parent_window, terminal_panel):
-        super().__init__(title="Cluster – Send to Terminals")
-        self.set_transient_for(parent_window)
-        self.set_modal(False)
-        self.set_default_size(480, 420)
-        self.set_resizable(True)
-
-        self._terminal_panel = terminal_panel
-        # [(CheckButton, TerminalWidget)]
-        self._checks: list[tuple[Gtk.CheckButton, object]] = []
+        self._panel = terminal_panel
+        self._checks: list[tuple[QCheckBox, object]] = []
         self._history: list[str] = []
-        self._history_index: int = -1
+        self._history_idx = -1
 
-        self._build_ui()
-        self.connect("close-request", self._on_close_request)
+        layout = QVBoxLayout(self)
 
-        # History navigation: Ctrl+Up / Ctrl+Down
-        key_ctrl = Gtk.EventControllerKey()
-        key_ctrl.connect("key-pressed", self._on_entry_key_pressed)
-        self._entry.add_controller(key_ctrl)
+        # Quick-select row
+        qs = QHBoxLayout()
+        for label, fn in [("All", self._select_all), ("None", self._select_none), ("Invert", self._select_invert)]:
+            btn = QPushButton(label)
+            btn.setFixedWidth(70)
+            btn.clicked.connect(fn)
+            qs.addWidget(btn)
+        qs.addStretch()
+        layout.addLayout(qs)
 
-    # -----------------------------------------------------------------
-    # UI construction
-    # -----------------------------------------------------------------
+        # Terminal list
+        sep = QFrame()
+        sep.setFrameShape(QFrame.Shape.HLine)
+        layout.addWidget(sep)
 
-    def _build_ui(self):
-        box = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=6)
-        box.set_margin_start(10)
-        box.set_margin_end(10)
-        box.set_margin_top(10)
-        box.set_margin_bottom(10)
+        self._scroll_area = QScrollArea()
+        self._scroll_area.setWidgetResizable(True)
+        self._list_widget = QWidget()
+        self._list_layout = QVBoxLayout(self._list_widget)
+        self._list_layout.setAlignment(Qt.AlignmentFlag.AlignTop)
+        self._scroll_area.setWidget(self._list_widget)
+        layout.addWidget(self._scroll_area, stretch=1)
 
-        # --- Quick-select buttons ---
-        btn_row = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=6)
-        for label_text, handler in [
-            ("All", self._on_select_all),
-            ("None", self._on_select_none),
-            ("Invert", self._on_select_invert),
-        ]:
-            btn = Gtk.Button(label=label_text)
-            btn.connect("clicked", handler)
-            btn_row.append(btn)
-        box.append(btn_row)
+        sep2 = QFrame()
+        sep2.setFrameShape(QFrame.Shape.HLine)
+        layout.addWidget(sep2)
 
-        # --- Terminal checklist (scrollable, resizable) ---
-        sw = Gtk.ScrolledWindow()
-        sw.set_policy(Gtk.PolicyType.NEVER, Gtk.PolicyType.AUTOMATIC)
-        sw.set_vexpand(True)
+        # Command entry + send
+        entry_row = QHBoxLayout()
+        self._entry = QLineEdit()
+        self._entry.setPlaceholderText("Command to broadcast…")
+        self._entry.returnPressed.connect(self._send)
+        entry_row.addWidget(self._entry)
 
-        self._list_box = Gtk.Box(
-            orientation=Gtk.Orientation.VERTICAL, spacing=2
-        )
-        self._list_box.set_margin_start(4)
-        self._list_box.set_margin_end(4)
-        self._list_box.set_margin_top(4)
-        self._list_box.set_margin_bottom(4)
-        sw.set_child(self._list_box)
-        box.append(sw)
+        send_btn = QPushButton("Send")
+        send_btn.clicked.connect(self._send)
+        entry_row.addWidget(send_btn)
+        layout.addLayout(entry_row)
 
-        self._populate_terminal_list()
+        # History shortcuts
+        up = QShortcut(QKeySequence("Ctrl+Up"), self._entry)
+        up.activated.connect(self._history_prev)
+        down = QShortcut(QKeySequence("Ctrl+Down"), self._entry)
+        down.activated.connect(self._history_next)
 
-        # --- Separator ---
-        box.append(Gtk.Separator())
+        self._refresh_list()
 
-        # --- Command entry row ---
-        entry_row = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=6)
+    # ------------------------------------------------------------------
 
-        self._entry = Gtk.Entry()
-        self._entry.set_placeholder_text("Type command and press Enter…")
-        self._entry.set_hexpand(True)
-        self._entry.connect("activate", self._on_send)
-        entry_row.append(self._entry)
-
-        btn_send = Gtk.Button(label="Send")
-        btn_send.add_css_class("suggested-action")
-        btn_send.connect("clicked", self._on_send)
-        entry_row.append(btn_send)
-
-        box.append(entry_row)
-
-        # --- Bottom button row ---
-        bottom_row = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=6)
-        bottom_row.set_halign(Gtk.Align.END)
-
-        btn_close = Gtk.Button(label="Close")
-        btn_close.connect("clicked", lambda _: self.close())
-        bottom_row.append(btn_close)
-
-        box.append(bottom_row)
-
-        self.set_child(box)
-
-        # Focus the command entry (return False so idle fires only once)
-        GLib.idle_add(lambda: self._entry.grab_focus() and False)
-
-    # -----------------------------------------------------------------
-    # Terminal list
-    # -----------------------------------------------------------------
-
-    def _populate_terminal_list(self):
-        """Fill the checklist with all open terminals."""
-        self._checks.clear()
-        terminals = self._terminal_panel.get_terminal_info()
-        if not terminals:
-            lbl = Gtk.Label(label="No open terminals")
-            lbl.add_css_class("dim-label")
-            self._list_box.append(lbl)
-            return
-
-        for title, terminal in terminals:
-            cb = Gtk.CheckButton(label=title)
-            cb.connect("toggled", self._on_check_toggled, terminal)
-            self._list_box.append(cb)
-            self._checks.append((cb, terminal))
-
-    def refresh(self):
-        """Rebuild the terminal list (call when tabs change)."""
-        # Remember which terminals were selected
-        selected = {t for cb, t in self._checks if cb.get_active()}
-
-        # Clear old list
-        child = self._list_box.get_first_child()
-        while child:
-            nxt = child.get_next_sibling()
-            self._list_box.remove(child)
-            child = nxt
+    def _refresh_list(self):
+        # Clear
+        while self._list_layout.count():
+            item = self._list_layout.takeAt(0)
+            if item.widget():
+                item.widget().deleteLater()
         self._checks.clear()
 
-        # Rebuild
-        terminals = self._terminal_panel.get_terminal_info()
+        terminals = self._panel.get_all_terminals()
         if not terminals:
-            lbl = Gtk.Label(label="No open terminals")
-            lbl.add_css_class("dim-label")
-            self._list_box.append(lbl)
+            self._list_layout.addWidget(QLabel("No terminals open."))
             return
 
-        for title, terminal in terminals:
-            cb = Gtk.CheckButton(label=title)
-            # Restore previous selection
-            if terminal in selected:
-                cb.set_active(True)
-            cb.connect("toggled", self._on_check_toggled, terminal)
-            self._list_box.append(cb)
-            self._checks.append((cb, terminal))
+        for term in terminals:
+            conn = getattr(term, "connection", None)
+            label = conn.name if conn and conn.name else "Terminal"
+            if conn and conn.command:
+                parts = conn.command.split()
+                dest = parts[-1] if parts else ""
+                if dest:
+                    label = f"{label}  ({dest})"
+            cb = QCheckBox(label)
+            cb.setChecked(True)
+            self._checks.append((cb, term))
+            self._list_layout.addWidget(cb)
 
-    # -----------------------------------------------------------------
-    # Callbacks
-    # -----------------------------------------------------------------
-
-    def _on_check_toggled(self, check_button, terminal):
-        self._terminal_panel.set_cluster_highlight(
-            terminal, check_button.get_active()
-        )
-
-    def _on_select_all(self, *_):
+    def _select_all(self):
         for cb, _ in self._checks:
-            cb.set_active(True)
+            cb.setChecked(True)
 
-    def _on_select_none(self, *_):
+    def _select_none(self):
         for cb, _ in self._checks:
-            cb.set_active(False)
+            cb.setChecked(False)
 
-    def _on_select_invert(self, *_):
+    def _select_invert(self):
         for cb, _ in self._checks:
-            cb.set_active(not cb.get_active())
+            cb.setChecked(not cb.isChecked())
 
-    def _on_send(self, *_):
-        """Send the command to all checked terminals."""
-        text = self._entry.get_text()
-        if not text:
+    def _send(self):
+        cmd = self._entry.text()
+        if not cmd:
             return
+        for cb, term in self._checks:
+            if cb.isChecked():
+                term.send_text(cmd + "\n")
+        # History
+        if not self._history or self._history[-1] != cmd:
+            self._history.append(cmd)
+        self._history_idx = len(self._history)
+        self._entry.clear()
 
-        selected = [t for cb, t in self._checks if cb.get_active()]
-        if selected:
-            self._terminal_panel.send_to_selected(text + "\n", selected)
-
-        # Save to history
-        if not self._history or self._history[-1] != text:
-            self._history.append(text)
-        self._history_index = -1
-
-        self._entry.set_text("")
-        self._entry.grab_focus()
-
-    def _on_entry_key_pressed(self, controller, keyval, keycode, state):
-        """Handle Ctrl+Up / Ctrl+Down for command history."""
-        if not (state & Gdk.ModifierType.CONTROL_MASK):
-            return False
+    def _history_prev(self):
         if not self._history:
-            return False
+            return
+        self._history_idx = max(0, self._history_idx - 1)
+        self._entry.setText(self._history[self._history_idx])
 
-        key = Gdk.keyval_name(keyval)
-        if key and key.upper() == "UP":
-            self._history_index -= 1
-            if self._history_index < -1:
-                self._history_index = len(self._history) - 1
-        elif key and key.upper() == "DOWN":
-            self._history_index += 1
-            if self._history_index >= len(self._history):
-                self._history_index = -1
+    def _history_next(self):
+        if not self._history:
+            return
+        self._history_idx = min(len(self._history), self._history_idx + 1)
+        if self._history_idx < len(self._history):
+            self._entry.setText(self._history[self._history_idx])
         else:
-            return False
+            self._entry.clear()
 
-        if self._history_index >= 0:
-            self._entry.set_text(self._history[self._history_index])
-        else:
-            self._entry.set_text("")
-        # Move cursor to end
-        self._entry.set_position(-1)
-        return True
-
-    def _on_close_request(self, *_):
-        """Clear all highlights when the window is closed."""
-        self._on_select_none()
-        return False  # allow default close
-
-    def get_selected_terminals(self) -> list:
-        """Return the list of currently checked terminals."""
-        return [t for cb, t in self._checks if cb.get_active()]
+    def showEvent(self, event):
+        super().showEvent(event)
+        self._refresh_list()
