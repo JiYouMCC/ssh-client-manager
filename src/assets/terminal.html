@@ -116,6 +116,10 @@
 
     term.onResize(({ cols, rows }) => sendResize());
 
+    term.onTitleChange(title => {
+      if (title) document.title = title;
+    });
+
     const resizeObserver = new ResizeObserver(() => {
       fitAddon.fit();
     });

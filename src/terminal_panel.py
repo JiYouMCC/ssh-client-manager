@@ -12,7 +12,7 @@ Supports:
 from typing import Optional
 
 from PySide6.QtCore import Qt, Signal, QMimeData, QPoint
-from PySide6.QtGui import QFont
+from PySide6.QtGui import QFont, QFontMetrics
 from PySide6.QtWidgets import (
     QWidget, QSplitter, QTabWidget, QTabBar, QHBoxLayout,
     QVBoxLayout, QPushButton, QLabel, QMenu, QApplication,
@@ -31,22 +31,48 @@ class TabLabel(QWidget):
 
     def __init__(self, title: str = "Terminal", parent=None):
         super().__init__(parent)
-        layout = QHBoxLayout(self)
-        layout.setContentsMargins(0, 0, 0, 0)
-        layout.setSpacing(4)
+        self._base_title = title
 
-        self._label = QLabel(title)
+        layout = QHBoxLayout(self)
+        layout.setContentsMargins(4, 0, 2, 0)
+        layout.setSpacing(5)
+
+        display = title if len(title) <= 30 else title[:26] + "..."
+        self._label = QLabel(display)
         layout.addWidget(self._label)
 
         btn = QPushButton("✕")
-        btn.setFixedSize(16, 16)
+        btn.setFixedSize(14, 14)
         btn.setFlat(True)
-        btn.setStyleSheet("QPushButton { font-size: 9px; padding: 0; }")
+        btn.setCursor(Qt.CursorShape.PointingHandCursor)
+        btn.setStyleSheet(
+            "QPushButton {"
+            "  font-size: 9px; padding: 0; border: none;"
+            "  border-radius: 3px; color: #888;"
+            "  background: transparent;"
+            "}"
+            "QPushButton:hover {"
+            "  background: rgba(255,255,255,0.15); color: #ddd;"
+            "}"
+        )
         btn.clicked.connect(self.close_clicked)
         layout.addWidget(btn)
 
+        self.setMaximumHeight(32)
+        self._apply_width(display)
+
+    def _apply_width(self, text: str):
+        fm = QFontMetrics(self._label.font())
+        self.setFixedWidth(fm.horizontalAdvance(text) + 75)
+
     def set_title(self, title: str):
-        self._label.setText(title)
+        display = title.strip() if title else ""
+        if not display:
+            display = self._base_title
+        if len(display) > 30:
+            display = display[:26] + "..."
+        self._label.setText(display)
+        self._apply_width(display)
 
     def set_disconnected(self, disconnected: bool):
         font = self._label.font()
@@ -72,6 +98,7 @@ class PaneTabWidget(QTabWidget):
         self.setTabsClosable(False)   # We use custom close buttons
         self.setMovable(True)
         self.setDocumentMode(True)
+        self.tabBar().setMinimumHeight(36)
         self.tabBar().setContextMenuPolicy(Qt.ContextMenuPolicy.CustomContextMenu)
         self.tabBar().customContextMenuRequested.connect(self._tab_context_menu)
 
