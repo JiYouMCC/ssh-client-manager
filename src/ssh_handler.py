@@ -46,9 +46,9 @@ class SSHHandler:
             tunnels=params["tunnels"],
         )
 
-    def create_local_session(self) -> LocalShellSession:
+    def create_local_session(self, shell_preference: str = "auto") -> LocalShellSession:
         """Create a local shell session."""
-        return LocalShellSession()
+        return LocalShellSession(shell_preference=shell_preference)
 
     # ------------------------------------------------------------------
     # Command parsing

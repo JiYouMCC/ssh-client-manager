@@ -8,7 +8,6 @@ import json
 import os
 from pathlib import Path
 
-
 def get_config_dir() -> Path:
     """Return the config directory, creating it if needed."""
     config_dir = Path.home() / ".config" / "ssh-client-manager"
@@ -49,6 +48,8 @@ DEFAULTS = {
     "ssh_default_port": 22,
     "ssh_keepalive_interval": 60,
     "ssh_connection_timeout": 30,
+    # Global passphrases (up to 5)
+    "global_passphrases": [],
     # Behavior
     "confirm_close_tab": True,
     "confirm_close_window": True,
@@ -56,6 +57,16 @@ DEFAULTS = {
     "word_separators": "-A-Za-z0-9,./?%&#:_=+@~",
     # Cluster mode
     "cluster_mode_enabled": False,
+    # Terminal logging
+    "terminal_logging_enabled": False,
+    "terminal_log_dir": str(Path.home() / "ssh-logs"),
+    # Session recording
+    "recording_enabled": False,
+    "recording_dir": str(Path.home() / "Documents" / "SSHClientManager-Recordings"),
+    # Screenshot
+    "screenshot_watermark": "",
+    # Local shell
+    "local_shell_windows": "auto",  # "auto" (pwsh → powershell → cmd), "powershell", "cmd"
 }
 
 

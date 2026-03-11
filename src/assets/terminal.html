@@ -5,6 +5,8 @@
   <style>
     * { margin: 0; padding: 0; box-sizing: border-box; }
     html, body { width: 100%; height: 100%; overflow: hidden; background: #1e1e2e; }
+    /* padding-top compensates for the QTabBar overlapping the content in documentMode */
+    body { padding-top: var(--tab-overlap, 0px); }
     #terminal { width: 100%; height: 100%; }
   </style>
   <link rel="stylesheet" href="xterm.css">
@@ -22,6 +24,12 @@
     const fontSize = parseInt(params.get('font_size') || '12');
     const scrollback = parseInt(params.get('scrollback') || '10000');
     const cursorStyle = params.get('cursor') || 'block';
+
+    // Apply tab bar overlap compensation
+    const tabOverlap = parseInt(params.get('tab_overlap') || '0');
+    if (tabOverlap > 0) {
+      document.body.style.setProperty('--tab-overlap', tabOverlap + 'px');
+    }
 
     // Parse 16-color palette if provided
     let palette = null;
@@ -126,8 +134,17 @@
     resizeObserver.observe(document.getElementById('terminal'));
 
     // Context menu: copy/paste via keyboard shortcut instead
-    // Ctrl+Shift+C = copy, Ctrl+Shift+V = paste
+    // Ctrl+Shift+C = copy, Ctrl+Shift+V = paste, Ctrl+=/−/0 = zoom
+    let currentFontSize = fontSize;
+
+    function applyFontSize(size) {
+      currentFontSize = Math.max(6, Math.min(72, size));
+      term.options.fontSize = currentFontSize;
+      fitAddon.fit();
+    }
+
     term.attachCustomKeyEventHandler((e) => {
+      if (e.type !== 'keydown') return true;
       if (e.ctrlKey && e.shiftKey && e.key === 'C') {
         const sel = term.getSelection();
         if (sel) navigator.clipboard.writeText(sel).catch(() => {});
@@ -137,8 +154,78 @@
         navigator.clipboard.readText().then(t => term.paste(t)).catch(() => {});
         return false;
       }
+      // Zoom in: Ctrl+=  or Ctrl+Shift+=
+      if (e.ctrlKey && (e.key === '=' || e.key === '+')) {
+        applyFontSize(currentFontSize + 1);
+        return false;
+      }
+      // Zoom out: Ctrl+-
+      if (e.ctrlKey && e.key === '-') {
+        applyFontSize(currentFontSize - 1);
+        return false;
+      }
+      // Reset zoom: Ctrl+0
+      if (e.ctrlKey && e.key === '0') {
+        applyFontSize(fontSize);
+        return false;
+      }
       return true;
     });
+
+    // Ctrl+scroll to zoom
+    document.addEventListener('wheel', (e) => {
+      if (e.ctrlKey) {
+        e.preventDefault();
+        applyFontSize(currentFontSize + (e.deltaY < 0 ? 1 : -1));
+      }
+    }, { passive: false });
+
+    // Expose zoom controls for Python/Qt to call via runJavaScript
+    window.termZoomIn  = () => applyFontSize(currentFontSize + 1);
+    window.termZoomOut = () => applyFontSize(currentFontSize - 1);
+    window.termZoomReset = () => applyFontSize(fontSize);
+
+    // Returns pixel rect (in physical pixels) for the selected rows,
+    // or null if nothing is selected.  Used by the Python screenshot feature.
+    window.getSelectionPixelRect = function() {
+      try {
+        if (!term.hasSelection()) return null;
+        var pos = term.getSelectionPosition ? term.getSelectionPosition() : null;
+        if (!pos) return null;
+
+        var core = term._core;
+        var dims = (core._renderService && core._renderService.dimensions) ||
+                   (core.renderService && core.renderService.dimensions);
+        if (!dims) return null;
+        var cellH = dims.actualCellHeight || (dims.css && dims.css.cell && dims.css.cell.height) || 16;
+
+        var screen = document.querySelector('.xterm-screen');
+        if (!screen) return null;
+        var sr = screen.getBoundingClientRect();
+
+        var viewport = document.querySelector('.xterm-viewport');
+        var scrollTop = viewport ? viewport.scrollTop : 0;
+
+        // Return CSS pixel values (no DPR scaling).
+        // Python will scale by the pixmap's own devicePixelRatio.
+        var startY = sr.top + pos.startRow * cellH - scrollTop;
+        var endY   = sr.top + (pos.endRow + 1) * cellH - scrollTop;
+
+        return {
+          x: Math.round(sr.left),
+          y: Math.round(startY),
+          w: Math.round(sr.width),
+          h: Math.round(endY - startY),
+          dpr: window.devicePixelRatio || 1
+        };
+      } catch(e) { return null; }
+    };
+
+    window._savedSelectionRect = null;
+    document.addEventListener('contextmenu', function() {
+      window._savedSelectionRect = window.getSelectionPixelRect
+        ? window.getSelectionPixelRect() : null;
+    }, true);
 
     connect();
   </script>

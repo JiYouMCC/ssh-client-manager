@@ -55,6 +55,104 @@ class BaseSession:
         # Signals (set by owner)
         self.on_title_changed = None   # callback(title: str)
         self.on_disconnected = None    # callback()
+        # Logging / recording (set by owner after construction)
+        self.log_file_path: Optional[str] = None
+        self.recording_file_path: Optional[str] = None
+        self._log_fh = None
+        self._rec_fh = None
+        self._rec_start: Optional[float] = None
+
+    def _open_output_files(self, cols: int = 220, rows: int = 50):
+        """Open log and/or recording files for writing."""
+        import time as _time
+        if self.log_file_path:
+            try:
+                import pathlib
+                pathlib.Path(self.log_file_path).parent.mkdir(parents=True, exist_ok=True)
+                self._log_fh = open(self.log_file_path, "a", encoding="utf-8", errors="replace")
+            except Exception as e:
+                print(f"[session] Cannot open log file: {e}")
+
+        if self.recording_file_path:
+            try:
+                import pathlib, json as _json
+                pathlib.Path(self.recording_file_path).parent.mkdir(parents=True, exist_ok=True)
+                self._rec_fh = open(self.recording_file_path, "w", encoding="utf-8")
+                self._rec_start = _time.time()
+                header = _json.dumps({
+                    "version": 2, "width": cols, "height": rows,
+                    "timestamp": int(self._rec_start), "title": ""
+                })
+                self._rec_fh.write(header + "\n")
+                self._rec_fh.flush()
+            except Exception as e:
+                print(f"[session] Cannot open recording file: {e}")
+
+    def _write_output(self, data: bytes):
+        """Write output data to log and recording files."""
+        import time as _time, json as _json
+        text = data.decode("utf-8", errors="replace")
+        if self._log_fh:
+            try:
+                self._log_fh.write(text)
+                self._log_fh.flush()
+            except Exception:
+                pass
+        if self._rec_fh and self._rec_start is not None:
+            try:
+                ts = round(_time.time() - self._rec_start, 6)
+                event = _json.dumps([ts, "o", text])
+                self._rec_fh.write(event + "\n")
+                self._rec_fh.flush()
+            except Exception:
+                pass
+
+    def _close_output_files(self):
+        if self._log_fh:
+            try:
+                self._log_fh.close()
+            except Exception:
+                pass
+            self._log_fh = None
+        if self._rec_fh:
+            try:
+                self._rec_fh.close()
+            except Exception:
+                pass
+            self._rec_fh = None
+
+    def start_recording(self, file_path: str, cols: int = 220, rows: int = 50):
+        """Open a new recording file mid-session (asciicast v2)."""
+        import time as _time, json as _json, pathlib
+        # Close any existing recording first
+        self.stop_recording()
+        self.recording_file_path = file_path
+        try:
+            pathlib.Path(file_path).parent.mkdir(parents=True, exist_ok=True)
+            self._rec_fh = open(file_path, "w", encoding="utf-8")
+            self._rec_start = _time.time()
+            header = _json.dumps({
+                "version": 2, "width": cols, "height": rows,
+                "timestamp": int(self._rec_start), "title": "",
+            })
+            self._rec_fh.write(header + "\n")
+            self._rec_fh.flush()
+        except Exception as e:
+            print(f"[session] Cannot open recording file: {e}")
+            self._rec_fh = None
+            self._rec_start = None
+            self.recording_file_path = None
+
+    def stop_recording(self):
+        """Close the current recording file."""
+        if self._rec_fh:
+            try:
+                self._rec_fh.close()
+            except Exception:
+                pass
+            self._rec_fh = None
+        self._rec_start = None
+        self.recording_file_path = None
 
     # ------------------------------------------------------------------
     # Public API
@@ -99,10 +197,12 @@ class BaseSession:
 
     async def _handle_ws(self, websocket):
         self._ws_client = websocket
+        self._open_output_files()
         try:
             await self._start_io(websocket)
         finally:
             self._ws_client = None
+            self._close_output_files()
             if self.on_disconnected:
                 self.on_disconnected()
 
@@ -430,6 +530,7 @@ class SSHSession(BaseSession):
                     if data is None:
                         break
                     if data:
+                        self._write_output(data)
                         await websocket.send(bytes(data))
                 except Exception:
                     break
@@ -472,17 +573,24 @@ class LocalShellSession(BaseSession):
     """
     Local interactive shell session.
 
-    Windows: PowerShell → cmd.exe fallback
+    Windows: PowerShell → cmd.exe fallback (or explicit preference)
     Unix: $SHELL → /bin/bash fallback
     """
 
-    def __init__(self, term_type: str = "xterm-256color"):
+    def __init__(self, term_type: str = "xterm-256color", shell_preference: str = "auto"):
         super().__init__()
         self.term_type = term_type
+        self._shell_preference = shell_preference
 
-    @staticmethod
-    def _get_shell_cmd() -> list[str]:
+    def _get_shell_cmd(self) -> list[str]:
         if platform.system() == "Windows":
+            pref = self._shell_preference
+            if pref == "cmd":
+                return ["cmd.exe"]
+            if pref == "powershell":
+                ps = shutil.which("pwsh") or shutil.which("powershell")
+                return [ps, "-NoLogo"] if ps else ["cmd.exe"]
+            # auto: prefer pwsh/powershell, fall back to cmd
             ps = shutil.which("pwsh") or shutil.which("powershell")
             if ps:
                 return [ps, "-NoLogo"]
@@ -495,93 +603,116 @@ class LocalShellSession(BaseSession):
         env = os.environ.copy()
         env["TERM"] = self.term_type
 
+        if platform.system() == "Windows":
+            await self._start_io_windows(websocket, cmd, env)
+        else:
+            await self._start_io_unix(websocket, cmd, env)
+
+    async def _start_io_windows(self, websocket, cmd, env):
+        """Windows local shell via ConPTY (pywinpty). Falls back to pipe on import error."""
         try:
-            if platform.system() == "Windows":
-                proc = await asyncio.create_subprocess_exec(
-                    *cmd,
-                    stdin=asyncio.subprocess.PIPE,
-                    stdout=asyncio.subprocess.PIPE,
-                    stderr=asyncio.subprocess.STDOUT,
-                    env=env,
-                )
-            else:
-                # Unix: use PTY for proper terminal behaviour
-                import pty
-                master, slave = pty.openpty()
-                proc = await asyncio.create_subprocess_exec(
-                    *cmd,
-                    stdin=slave,
-                    stdout=slave,
-                    stderr=slave,
-                    env=env,
-                    close_fds=True,
-                )
-                os.close(slave)
+            import winpty as _winpty
+        except ImportError:
+            await websocket.send(
+                "\r\n\x1b[31mpywinpty is not installed. "
+                "Run: pip install pywinpty\x1b[0m\r\n"
+            )
+            return
 
-                async def pty_to_ws():
-                    loop = asyncio.get_event_loop()
-                    while self._running:
-                        try:
-                            data = await loop.run_in_executor(
-                                None, lambda: os.read(master, 4096)
-                            )
-                            if data:
-                                await websocket.send(bytes(data))
-                        except OSError:
-                            break
-
-                async def ws_to_pty():
-                    async for message in websocket:
-                        if isinstance(message, str):
-                            try:
-                                msg = json.loads(message)
-                                if msg.get("type") == "resize":
-                                    import fcntl, termios, struct
-                                    cols = msg.get("cols", 80)
-                                    rows = msg.get("rows", 24)
-                                    fcntl.ioctl(
-                                        master, termios.TIOCSWINSZ,
-                                        struct.pack("HHHH", rows, cols, 0, 0)
-                                    )
-                            except Exception:
-                                os.write(master, message.encode("utf-8", errors="replace"))
-                        else:
-                            os.write(master, message)
-
-                await asyncio.gather(pty_to_ws(), ws_to_pty(), return_exceptions=True)
-                os.close(master)
-                return
-
+        try:
+            pty_proc = _winpty.PtyProcess.spawn(cmd, dimensions=(24, 80), env=env)
         except Exception as e:
             await websocket.send(
                 f"\r\n\x1b[31mFailed to start shell: {e}\x1b[0m\r\n"
             )
             return
 
-        # Windows: simple pipe bridging (no PTY)
-        async def proc_to_ws():
+        loop = asyncio.get_event_loop()
+
+        async def pty_to_ws():
             while self._running:
                 try:
-                    data = await proc.stdout.read(4096)
-                    if not data:
-                        break
-                    await websocket.send(bytes(data))
+                    data = await loop.run_in_executor(None, lambda: pty_proc.read(4096))
+                    if data:
+                        encoded = data.encode("utf-8", errors="replace")
+                        self._write_output(encoded)
+                        await websocket.send(bytes(encoded))
+                except EOFError:
+                    break
                 except Exception:
                     break
 
-        async def ws_to_proc():
+        async def ws_to_pty():
             async for message in websocket:
                 if isinstance(message, str):
                     try:
-                        json.loads(message)  # ignore resize on Windows
+                        msg = json.loads(message)
+                        if msg.get("type") == "resize":
+                            cols = msg.get("cols", 80)
+                            rows = msg.get("rows", 24)
+                            pty_proc.setwinsize(rows, cols)
                     except Exception:
-                        if proc.stdin:
-                            proc.stdin.write(message.encode("utf-8", errors="replace"))
-                            await proc.stdin.drain()
+                        pty_proc.write(message)
                 else:
-                    if proc.stdin:
-                        proc.stdin.write(message)
-                        await proc.stdin.drain()
+                    pty_proc.write(message.decode("utf-8", errors="replace"))
 
-        await asyncio.gather(proc_to_ws(), ws_to_proc(), return_exceptions=True)
-        proc.terminate()
+        await asyncio.gather(pty_to_ws(), ws_to_pty(), return_exceptions=True)
+        try:
+            pty_proc.terminate(force=True)
+        except Exception:
+            pass
+
+    async def _start_io_unix(self, websocket, cmd, env):
+        """Unix local shell via PTY."""
+        try:
+            import pty
+            master, slave = pty.openpty()
+            proc = await asyncio.create_subprocess_exec(
+                *cmd,
+                stdin=slave,
+                stdout=slave,
+                stderr=slave,
+                env=env,
+                close_fds=True,
+            )
+            os.close(slave)
+        except Exception as e:
+            await websocket.send(
+                f"\r\n\x1b[31mFailed to start shell: {e}\x1b[0m\r\n"
+            )
+            return
+
+        async def pty_to_ws():
+            loop = asyncio.get_event_loop()
+            while self._running:
+                try:
+                    data = await loop.run_in_executor(
+                        None, lambda: os.read(master, 4096)
+                    )
+                    if data:
+                        self._write_output(data)
+                        await websocket.send(bytes(data))
+                except OSError:
+                    break
+
+        async def ws_to_pty():
+            async for message in websocket:
+                if isinstance(message, str):
+                    try:
+                        msg = json.loads(message)
+                        if msg.get("type") == "resize":
+                            import fcntl, termios, struct
+                            cols = msg.get("cols", 80)
+                            rows = msg.get("rows", 24)
+                            fcntl.ioctl(
+                                master, termios.TIOCSWINSZ,
+                                struct.pack("HHHH", rows, cols, 0, 0)
+                            )
+                    except Exception:
+                        os.write(master, message.encode("utf-8", errors="replace"))
+                else:
+                    os.write(master, message)
+
+        await asyncio.gather(pty_to_ws(), ws_to_pty(), return_exceptions=True)
+        os.close(master)
+

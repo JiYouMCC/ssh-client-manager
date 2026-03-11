@@ -43,6 +43,11 @@ class Connection:
     # TERM env var override
     term_type: str = ""
 
+    # Favorites / tags / dependency
+    favorite: bool = False
+    tags: str = ""          # comma-separated tags
+    open_after: str = ""    # connection ID to auto-connect first
+
     def __post_init__(self):
         if not self.id:
             self.id = str(uuid.uuid4())
@@ -82,6 +87,7 @@ class ConnectionManager:
         self._file = get_config_dir() / "connections.json"
         self._connections: list[Connection] = []
         self._groups: list[str] = []
+        self._group_order: list[str] = []
         self.load()
 
     def load(self):
@@ -93,6 +99,7 @@ class ConnectionManager:
         if not self._file.exists():
             self._connections = []
             self._groups = []
+            self._group_order = []
             return
 
         try:
@@ -118,6 +125,7 @@ class ConnectionManager:
                     continue
 
             self._groups = data.get("groups", [])
+            self._group_order = data.get("group_order", [])
             for conn in self._connections:
                 if conn.group and conn.group not in self._groups:
                     self._groups.append(conn.group)
@@ -129,6 +137,7 @@ class ConnectionManager:
         except (json.JSONDecodeError, IOError):
             self._connections = []
             self._groups = []
+            self._group_order = []
 
     @staticmethod
     def _migrate_to_command(item: dict) -> str:
@@ -172,6 +181,7 @@ class ConnectionManager:
         data = {
             "connections": [asdict(c) for c in self._connections],
             "groups": sorted(set(self._groups)),
+            "group_order": self._group_order,
         }
         try:
             with open(self._file, "w") as f:
@@ -264,6 +274,13 @@ class ConnectionManager:
         """Get all groups, sorted."""
         return sorted(set(self._groups))
 
+    def get_groups_ordered(self) -> list[str]:
+        """Get groups respecting user-defined order, with unordered groups appended alphabetically."""
+        all_groups = set(self._groups)
+        result = [g for g in self._group_order if g in all_groups]
+        remaining = sorted(all_groups - set(result))
+        return result + remaining
+
     def get_group_tree(self) -> dict:
         """
         Build a hierarchical group tree.
@@ -294,6 +311,7 @@ class ConnectionManager:
         data = {
             "connections": [asdict(c) for c in self._connections],
             "groups": self.get_groups(),
+            "group_order": self._group_order,
         }
         return json.dumps(data, indent=2)
 
@@ -303,7 +321,9 @@ class ConnectionManager:
             data = json.loads(json_str)
             imported = []
             for item in data.get("connections", []):
-                conn = Connection(**item)
+                valid_keys = {f.name for f in Connection.__dataclass_fields__.values()}
+                filtered = {k: v for k, v in item.items() if k in valid_keys}
+                conn = Connection(**filtered)
                 conn.id = str(uuid.uuid4())  # Always generate new IDs
                 imported.append(conn)
 

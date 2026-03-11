@@ -200,7 +200,7 @@ QTreeWidget::branch {
     background-color: #e6e9ef;
 }
 
-/* ── Tab widget ─────────────────────────────────────────────────────────── */
+/* ── Tab widget (horizontal — terminal panel) ───────────────────────────── */
 QTabWidget::pane {
     border: none;
     background-color: #eff1f5;
@@ -226,6 +226,35 @@ QTabBar::tab:selected {
 }
 
 QTabBar::tab:hover:!selected {
+    background-color: #ccd0da;
+    color: #4c4f69;
+}
+
+/* ── Preferences dialog tabs — compact top tabs, no scroll ──────────────── */
+#prefsTabWidget::pane {
+    border: 1px solid #ccd0da;
+    border-top: none;
+    background-color: #eff1f5;
+}
+
+#prefsTabWidget QTabBar::tab {
+    padding: 5px 10px;
+    min-width: 0;
+    border: 1px solid transparent;
+    border-bottom: none;
+    border-top-left-radius: 4px;
+    border-top-right-radius: 4px;
+    margin-right: 2px;
+}
+
+#prefsTabWidget QTabBar::tab:selected {
+    background-color: #eff1f5;
+    color: #4c4f69;
+    border-color: #ccd0da;
+    border-bottom-color: #eff1f5;
+}
+
+#prefsTabWidget QTabBar::tab:hover:!selected {
     background-color: #ccd0da;
     color: #4c4f69;
 }

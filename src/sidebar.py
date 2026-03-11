@@ -3,19 +3,19 @@ Sidebar with hierarchical connection tree.
 
 Displays connections organized in groups using QTreeWidget.
 Supports right-click context menu, double-click to connect,
-and live search filtering.
+favorites (⭐), tags filtering, live search, and drag-and-drop.
 """
 
 from __future__ import annotations
 
 from typing import Optional
 
-from PySide6.QtCore import Qt, Signal, QSortFilterProxyModel
-from PySide6.QtGui import QIcon, QAction
+from PySide6.QtCore import Qt, Signal, QMimeData, QByteArray
+from PySide6.QtGui import QIcon, QAction, QDrag
 from PySide6.QtWidgets import (
     QWidget, QVBoxLayout, QHBoxLayout, QTreeWidget, QTreeWidgetItem,
     QLineEdit, QToolButton, QMenu, QInputDialog, QMessageBox, QSizePolicy,
-    QToolBar,
+    QToolBar, QCheckBox,
 )
 
 from .connection import Connection, ConnectionManager
@@ -31,6 +31,7 @@ class Sidebar(QWidget):
         delete_requested(str):  User chose Delete from context menu (conn_id)
         add_requested():        User wants to add a new connection
         add_group_requested():  User wants to add a new group
+        open_sftp_requested(str): User wants to open SFTP browser (conn_id)
     """
 
     connect_requested = Signal(str)
@@ -38,6 +39,7 @@ class Sidebar(QWidget):
     delete_requested = Signal(str)
     add_requested = Signal()
     add_group_requested = Signal()
+    open_sftp_requested = Signal(str)
 
     # Item data roles
     _CONN_ID_ROLE = Qt.ItemDataRole.UserRole
@@ -48,6 +50,7 @@ class Sidebar(QWidget):
         super().__init__()
         self.connection_manager = connection_manager
         self.credential_store = credential_store
+        self._show_favorites_only = False
 
         self.setMinimumWidth(180)
         self._build_ui()
@@ -77,6 +80,19 @@ class Sidebar(QWidget):
         self._act_add_group.setToolTip("Add Group")
         self._act_add_group.triggered.connect(self.add_group_requested.emit)
         toolbar.addAction(self._act_add_group)
+
+        self._act_sort_groups = QAction("↕", self)
+        self._act_sort_groups.setToolTip("Sort Groups")
+        self._act_sort_groups.triggered.connect(self._on_sort_groups)
+        toolbar.addAction(self._act_sort_groups)
+
+        toolbar.addSeparator()
+
+        self._act_favorites = QAction("⭐", self)
+        self._act_favorites.setToolTip("Show favorites only")
+        self._act_favorites.setCheckable(True)
+        self._act_favorites.triggered.connect(self._on_toggle_favorites)
+        toolbar.addAction(self._act_favorites)
 
         toolbar.addSeparator()
 
@@ -110,6 +126,10 @@ class Sidebar(QWidget):
         self._tree.customContextMenuRequested.connect(self._on_context_menu)
         self._tree.itemDoubleClicked.connect(self._on_item_double_clicked)
         self._tree.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Expanding)
+        self._tree.setDragEnabled(True)
+        self._tree.setAcceptDrops(True)
+        self._tree.setDropIndicatorShown(True)
+        self._tree.setDragDropMode(QTreeWidget.DragDropMode.InternalMove)
         layout.addWidget(self._tree)
 
     # ------------------------------------------------------------------
@@ -142,23 +162,33 @@ class Sidebar(QWidget):
             group_items[group_path] = item
             return item
 
-        # Build declared groups first (so empty groups appear)
-        for group_path in self.connection_manager.get_groups():
+        # Build declared groups first (respecting user-defined order)
+        for group_path in self.connection_manager.get_groups_ordered():
             if group_path:
                 get_group_item(group_path)
 
         # Add connections
         connections = self.connection_manager.get_connections()
         for conn in connections:
-            # Apply search filter
+            # Favorites filter
+            if self._show_favorites_only and not conn.favorite:
+                continue
+
+            # Apply search filter (name, display_name, group, tags)
             if filter_text:
-                haystack = f"{conn.name} {conn.display_name()} {conn.group}".lower()
+                haystack = f"{conn.name} {conn.display_name()} {conn.group} {conn.tags}".lower()
                 if filter_text not in haystack:
                     continue
 
             dest = conn.display_name()
-            label = f"🖥 {conn.name}" if conn.name else f"🖥 {dest}"
-            tooltip = dest if conn.name else ""
+            star = "⭐ " if conn.favorite else ""
+            label = f"🖥 {star}{conn.name}" if conn.name else f"🖥 {star}{dest}"
+            tooltip_parts = [dest] if conn.name else []
+            if conn.tags:
+                tooltip_parts.append(f"Tags: {conn.tags}")
+            if conn.description:
+                tooltip_parts.append(conn.description)
+            tooltip = "\n".join(tooltip_parts)
 
             if conn.group:
                 parent = get_group_item(conn.group)
@@ -172,7 +202,7 @@ class Sidebar(QWidget):
             item.setFlags(item.flags() | Qt.ItemFlag.ItemIsEnabled | Qt.ItemFlag.ItemIsSelectable)
 
         # Expand all when filtering
-        if filter_text:
+        if filter_text or self._show_favorites_only:
             self._tree.expandAll()
 
     def select_connection(self, conn_id: str):
@@ -197,6 +227,19 @@ class Sidebar(QWidget):
 
     def _on_search_changed(self, text: str):
         self.refresh()
+
+    def _on_toggle_favorites(self, checked: bool):
+        self._show_favorites_only = checked
+        self.refresh()
+
+    def _on_sort_groups(self):
+        try:
+            from .sort_groups_dialog import SortGroupsDialog
+            dlg = SortGroupsDialog(self, self.connection_manager)
+            if dlg.exec():
+                self.refresh()
+        except ImportError:
+            pass
 
     def _expand_all(self):
         self._tree.expandAll()
@@ -229,11 +272,18 @@ class Sidebar(QWidget):
         conn_id = item.data(0, self._CONN_ID_ROLE)
         if not conn_id:
             return
+        conn = self.connection_manager.get_connection(conn_id)
         menu = QMenu(self)
 
         act_connect = menu.addAction("🔌 Connect")
+        act_sftp = menu.addAction("📂 Open SFTP")
+        menu.addSeparator()
         act_edit = menu.addAction("✏ Edit")
         act_clone = menu.addAction("📋 Clone")
+        if conn and conn.favorite:
+            act_fav = menu.addAction("☆ Remove from Favorites")
+        else:
+            act_fav = menu.addAction("⭐ Add to Favorites")
         menu.addSeparator()
         act_delete = menu.addAction("🗑 Delete")
         menu.addSeparator()
@@ -242,10 +292,14 @@ class Sidebar(QWidget):
         chosen = menu.exec(global_pos)
         if chosen == act_connect:
             self.connect_requested.emit(conn_id)
+        elif chosen == act_sftp:
+            self.open_sftp_requested.emit(conn_id)
         elif chosen == act_edit:
             self.edit_requested.emit(conn_id)
         elif chosen == act_clone:
             self._clone_connection(conn_id)
+        elif chosen == act_fav:
+            self._toggle_favorite(conn_id)
         elif chosen == act_delete:
             self.delete_requested.emit(conn_id)
         elif chosen == act_export:
@@ -275,6 +329,14 @@ class Sidebar(QWidget):
     # ------------------------------------------------------------------
     # Actions
     # ------------------------------------------------------------------
+
+    def _toggle_favorite(self, conn_id: str):
+        conn = self.connection_manager.get_connection(conn_id)
+        if conn is None:
+            return
+        conn.favorite = not conn.favorite
+        self.connection_manager.update_connection(conn)
+        self.refresh()
 
     def _clone_connection(self, conn_id: str):
         conn = self.connection_manager.get_connection(conn_id)

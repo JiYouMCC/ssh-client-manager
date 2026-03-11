@@ -16,7 +16,7 @@ from PySide6.QtWidgets import (
     QVBoxLayout, QHBoxLayout, QLabel, QLineEdit, QTextEdit,
     QComboBox, QPushButton, QColorDialog, QMessageBox, QSizePolicy,
     QFileDialog, QTableWidget, QTableWidgetItem, QHeaderView,
-    QAbstractItemView,
+    QAbstractItemView, QCheckBox,
 )
 
 from .connection import Connection, ConnectionManager
@@ -46,7 +46,7 @@ class ConnectionDialog(QDialog):
         is_edit = connection is not None
 
         self.setWindowTitle("Edit Connection" if is_edit else "New Connection")
-        self.setMinimumSize(560, 620)
+        self.setMinimumSize(620, 620)
         self.setModal(True)
 
         layout = QVBoxLayout(self)
@@ -80,6 +80,9 @@ class ConnectionDialog(QDialog):
 
         self._combo_group = QComboBox()
         self._combo_group.setEditable(True)
+        self._combo_group.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Fixed)
+        self._combo_group.setSizeAdjustPolicy(QComboBox.SizeAdjustPolicy.AdjustToMinimumContentsLengthWithIcon)
+        self._combo_group.setMinimumContentsLength(30)
         self._combo_group.addItem("")
         for g in self.connection_manager.get_groups():
             self._combo_group.addItem(g)
@@ -92,6 +95,21 @@ class ConnectionDialog(QDialog):
         self._entry_desc = QLineEdit()
         self._entry_desc.setPlaceholderText("Optional description")
         form.addRow("Description:", self._entry_desc)
+
+        self._chk_favorite = QCheckBox("Mark as favorite (⭐)")
+        form.addRow("Favorite:", self._chk_favorite)
+
+        self._entry_tags = QLineEdit()
+        self._entry_tags.setPlaceholderText("e.g. production, web, linux")
+        form.addRow("Tags:", self._entry_tags)
+
+        # Open After: connection that auto-connects before this one
+        self._combo_open_after = QComboBox()
+        self._combo_open_after.addItem("(none)", "")
+        for conn in self.connection_manager.get_connections():
+            if conn.id != (self.connection.id if self.connection else ""):
+                self._combo_open_after.addItem(conn.name or conn.display_name(), conn.id)
+        form.addRow("Open After:", self._combo_open_after)
 
         self._text_command = QTextEdit()
         self._text_command.setPlaceholderText(
@@ -487,8 +505,14 @@ class ConnectionDialog(QDialog):
         self._combo_group.setCurrentText(conn.group or "")
         self._entry_name.setText(conn.name)
         self._entry_desc.setText(conn.description)
+        self._chk_favorite.setChecked(bool(conn.favorite))
+        self._entry_tags.setText(conn.tags or "")
+        # Open After combo
+        for i in range(self._combo_open_after.count()):
+            if self._combo_open_after.itemData(i) == conn.open_after:
+                self._combo_open_after.setCurrentIndex(i)
+                break
         # Set command first, then extract -i to populate key field
-        # Temporarily block the textChanged signal to avoid double-editing
         self._entry_key.blockSignals(True)
         self._text_command.setPlainText(conn.command)
         key_match = re.search(r'-i\s+(?:"([^"]+)"|\'([^\']+)\'|(\S+))', conn.command)
@@ -513,6 +537,10 @@ class ConnectionDialog(QDialog):
         pp2 = self.credential_store.get_passphrase2(conn.id)
         if pw:
             self._entry_password.setText(pw)
+        if pp1:
+            self._entry_pp1.setText(pp1)
+        if pp2:
+            self._entry_pp2.setText(pp2)
         if pp1:
             self._entry_pp1.setText(pp1)
         if pp2:
@@ -544,6 +572,9 @@ class ConnectionDialog(QDialog):
         conn.name = name
         conn.group = self._combo_group.currentText().strip()
         conn.description = self._entry_desc.text().strip()
+        conn.favorite = self._chk_favorite.isChecked()
+        conn.tags = self._entry_tags.text().strip()
+        conn.open_after = self._combo_open_after.currentData() or ""
         conn.command = command
         conn.commands = self._text_commands.toPlainText()
         conn.term_type = self._combo_term.currentText().strip()

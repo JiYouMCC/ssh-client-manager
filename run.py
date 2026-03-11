@@ -2,17 +2,9 @@
 """
 SSH Client Manager - Entry point (Windows / PySide6 edition).
 
-Features:
-- Split terminals (horizontal/vertical, unlimited nesting)
-- Tabbed interface per pane
-- Encrypted credential storage (AES/Fernet)
-- paramiko-based SSH authentication (password, key, passphrase)
-- xterm.js terminal via QWebEngineView
-- Cluster mode for broadcasting commands to multiple terminals
-- Hierarchical connection grouping
-
 Usage:
-    python run.py [--verbose]
+    python run.py           # no console window
+    python run.py --debug   # keep console visible for logging
 """
 
 import sys
@@ -30,6 +22,19 @@ if project_dir not in sys.path:
 
 # Required for QWebEngineView on some systems
 os.environ.setdefault("QTWEBENGINE_CHROMIUM_FLAGS", "--disable-gpu-sandbox")
+
+
+def _hide_console():
+    """Hide the Windows console window (no-op on non-Windows / frozen builds)."""
+    if sys.platform != "win32" or getattr(sys, "frozen", False):
+        return
+    try:
+        import ctypes
+        hwnd = ctypes.windll.kernel32.GetConsoleWindow()
+        if hwnd:
+            ctypes.windll.user32.ShowWindow(hwnd, 0)  # SW_HIDE
+    except Exception:
+        pass
 
 
 def _check_deps() -> bool:
@@ -66,16 +71,21 @@ def _check_deps() -> bool:
 
 def main():
     parser = argparse.ArgumentParser(description="SSH Client Manager")
+    parser.add_argument("--debug", "-d", action="store_true",
+                        help="Keep console visible and enable debug logging")
+    # keep --verbose as an alias
     parser.add_argument("--verbose", "-v", action="store_true",
-                        help="Enable verbose debug output")
+                        help=argparse.SUPPRESS)
     args = parser.parse_args()
 
-    if args.verbose:
+    debug = args.debug or args.verbose
+
+    if not debug:
+        _hide_console()
+    else:
         import logging
         logging.basicConfig(level=logging.DEBUG)
-        print("Verbose mode enabled")
-
-    print(f"SSH Client Manager v1.0.0  (Python {sys.version.split()[0]})")
+        print(f"SSH Client Manager — debug mode  (Python {sys.version.split()[0]})")
 
     if not _check_deps():
         sys.exit(1)
