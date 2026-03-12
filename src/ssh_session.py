@@ -171,11 +171,9 @@ class BaseSession:
             self._loop.call_soon_threadsafe(self._loop.stop)
 
     def send_input(self, data: str):
-        """Send input text to the session (called from main thread)."""
-        if self._loop and self._loop.is_running() and self._ws_client:
-            asyncio.run_coroutine_threadsafe(
-                self._ws_client.send(data), self._loop
-            )
+        """Send input text directly to the underlying shell/channel (not the display)."""
+        # Subclasses override this to write to their respective PTY / channel.
+        pass
 
     # ------------------------------------------------------------------
     # Internal
@@ -295,6 +293,17 @@ class SSHSession(BaseSession):
 
         self._transport = transport
         return client
+
+    def send_input(self, data: str):
+        """Write keystrokes directly to the SSH channel (bypasses display path)."""
+        if self._loop and self._loop.is_running() and self._channel:
+            asyncio.run_coroutine_threadsafe(
+                self._async_write_channel(data), self._loop
+            )
+
+    async def _async_write_channel(self, data: str):
+        if self._channel:
+            self._channel.send(data.encode("utf-8", errors="replace"))
 
     async def _start_io(self, websocket):
         # Connect in a thread pool (blocking I/O)
@@ -581,6 +590,21 @@ class LocalShellSession(BaseSession):
         super().__init__()
         self.term_type = term_type
         self._shell_preference = shell_preference
+        self._pty_proc = None       # Windows ConPTY (winpty.PtyProcess)
+        self._pty_master_fd = None  # Unix PTY master fd
+
+    def send_input(self, data: str):
+        """Write keystrokes directly to the local PTY (bypasses display path)."""
+        if self._pty_proc is not None:
+            try:
+                self._pty_proc.write(data)
+            except Exception:
+                pass
+        elif self._pty_master_fd is not None:
+            try:
+                os.write(self._pty_master_fd, data.encode("utf-8", errors="replace"))
+            except Exception:
+                pass
 
     def _get_shell_cmd(self) -> list[str]:
         if platform.system() == "Windows":
@@ -627,6 +651,7 @@ class LocalShellSession(BaseSession):
             )
             return
 
+        self._pty_proc = pty_proc
         loop = asyncio.get_event_loop()
 
         async def pty_to_ws():
@@ -657,6 +682,7 @@ class LocalShellSession(BaseSession):
                     pty_proc.write(message.decode("utf-8", errors="replace"))
 
         await asyncio.gather(pty_to_ws(), ws_to_pty(), return_exceptions=True)
+        self._pty_proc = None
         try:
             pty_proc.terminate(force=True)
         except Exception:
@@ -681,6 +707,8 @@ class LocalShellSession(BaseSession):
                 f"\r\n\x1b[31mFailed to start shell: {e}\x1b[0m\r\n"
             )
             return
+
+        self._pty_master_fd = master
 
         async def pty_to_ws():
             loop = asyncio.get_event_loop()
@@ -714,5 +742,6 @@ class LocalShellSession(BaseSession):
                     os.write(master, message)
 
         await asyncio.gather(pty_to_ws(), ws_to_pty(), return_exceptions=True)
+        self._pty_master_fd = None
         os.close(master)
 

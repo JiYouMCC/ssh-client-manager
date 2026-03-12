@@ -52,6 +52,7 @@ hiddenimports = [
     "src.cluster_window",
     "src.config",
     "src.credential_store",
+    "src.sender_panel",
 ]
 
 # ── Analysis ─────────────────────────────────────────────────────────────────

@@ -592,11 +592,11 @@ class ConnectionDialog(QDialog):
         pp1 = self._entry_pp1.text()
         pp2 = self._entry_pp2.text()
         if pw:
-            self.credential_store.set_password(conn.id, pw)
+            self.credential_store.store_password(conn.id, pw)
         if pp1:
-            self.credential_store.set_passphrase1(conn.id, pp1)
+            self.credential_store.store_passphrase1(conn.id, pp1)
         if pp2:
-            self.credential_store.set_passphrase2(conn.id, pp2)
+            self.credential_store.store_passphrase2(conn.id, pp2)
 
         self.connection_saved.emit(conn)
         self.accept()

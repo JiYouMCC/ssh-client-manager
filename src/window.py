@@ -28,6 +28,7 @@ from .credential_store import CredentialStore
 from .ssh_handler import SSHHandler
 from .terminal_panel import TerminalPanel
 from .sidebar import Sidebar
+from .sender_panel import SenderPanel
 
 try:
     from .connection_dialog import ConnectionDialog
@@ -125,19 +126,25 @@ class MainWindow(QMainWindow):
     # ------------------------------------------------------------------
 
     def _build_ui(self):
-        """Build central splitter with sidebar and terminal panel."""
+        """Build central splitter with sidebar, terminal panel, and sender panel."""
         self.terminal_panel = TerminalPanel(self.config)
         self.sidebar = Sidebar(self.connection_manager, self.credential_store)
+
+        self._sender_panel = SenderPanel()
+        self._sender_panel.send_to_active.connect(self._on_sender_to_active)
+        self._sender_panel.send_to_all.connect(self._on_sender_to_all)
 
         self._splitter = QSplitter(Qt.Orientation.Horizontal)
         self._splitter.addWidget(self.sidebar)
         self._splitter.addWidget(self.terminal_panel)
+        self._splitter.addWidget(self._sender_panel)
 
         sidebar_width = int(self.config.get("sidebar_width", 220))
         total = self.width()
-        self._splitter.setSizes([sidebar_width, max(total - sidebar_width, 200)])
+        self._splitter.setSizes([sidebar_width, max(total - sidebar_width - 320, 200), 320])
         self._splitter.setCollapsible(0, True)
         self._splitter.setCollapsible(1, False)
+        self._splitter.setCollapsible(2, True)
 
         self.setCentralWidget(self._splitter)
 
@@ -232,6 +239,13 @@ class MainWindow(QMainWindow):
         act_snippets.triggered.connect(self._on_snippets)
         tools_menu.addAction(act_snippets)
 
+        act_sender = QAction("📤 &Sender Panel", self)
+        act_sender.setShortcut(QKeySequence("F10"))
+        act_sender.setCheckable(True)
+        act_sender.triggered.connect(self._on_toggle_sender)
+        tools_menu.addAction(act_sender)
+        self._act_sender_menu = act_sender
+
         act_recordings = QAction("⏺ Session &Recordings…", self)
         act_recordings.triggered.connect(self._on_recordings)
         tools_menu.addAction(act_recordings)
@@ -322,6 +336,13 @@ class MainWindow(QMainWindow):
 
         tb.addSeparator()
 
+        self._act_sender = QAction("📤 Sender", self)
+        self._act_sender.setToolTip("Toggle Sender panel  (F10)")
+        self._act_sender.setCheckable(True)
+        self._act_sender.setChecked(True)
+        self._act_sender.triggered.connect(self._on_toggle_sender)
+        tb.addAction(self._act_sender)
+
         act_prefs = QAction("⚙ Prefs", self)
         act_prefs.setToolTip("Open preferences")
         act_prefs.triggered.connect(self._on_preferences)
@@ -351,6 +372,7 @@ class MainWindow(QMainWindow):
         _sc("Ctrl+Shift+Tab",  self.terminal_panel.prev_tab)
         _sc("Ctrl+Shift+D",    self.terminal_panel.clone_active_tab)
         _sc("F9",              self._on_toggle_sidebar)
+        _sc("F10",             self._on_toggle_sender)
 
         # Zoom shortcuts (also handled in JS, but Python-side for consistency)
         _sc("Ctrl+=", lambda: self._zoom("in"))
@@ -572,6 +594,36 @@ class MainWindow(QMainWindow):
     # ------------------------------------------------------------------
     # Tools menu handlers
     # ------------------------------------------------------------------
+
+    def _on_toggle_sender(self, checked: bool = None):
+        visible = not self._sender_panel.isVisible() if checked is None else checked
+        self._act_sender.setChecked(visible)
+        if hasattr(self, "_act_sender_menu"):
+            self._act_sender_menu.setChecked(visible)
+
+        sizes = self._splitter.sizes()
+        sidebar = sizes[0] if len(sizes) >= 1 else 220
+        total   = self._splitter.width()
+
+        if visible:
+            sender_w = max(sizes[2], 320) if len(sizes) >= 3 and sizes[2] >= 50 else 320
+            term_w   = max(total - sidebar - sender_w, 200)
+            self._sender_panel.setVisible(True)
+            self._splitter.setSizes([sidebar, term_w, sender_w])
+            self._sender_panel.focus_editor()
+        else:
+            term_w = total - sidebar
+            self._splitter.setSizes([sidebar, term_w, 0])
+            self._sender_panel.setVisible(False)
+
+    def _on_sender_to_active(self, text: str):
+        term = self.terminal_panel.active_terminal
+        if term:
+            term.send_text(text)
+
+    def _on_sender_to_all(self, text: str):
+        for term in self.terminal_panel.get_all_terminals():
+            term.send_text(text)
 
     def _on_cluster(self, checked: bool):
         if not _HAS_CLUSTER:
