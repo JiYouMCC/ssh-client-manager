@@ -11,6 +11,7 @@ import shlex
 import shutil
 from typing import Optional
 
+from .config import Config
 from .connection import Connection
 from .credential_store import CredentialStore
 from .ssh_session import SSHSession, LocalShellSession
@@ -21,8 +22,9 @@ class SSHHandler:
     Parses SSH connection parameters and creates session objects.
     """
 
-    def __init__(self, credential_store: CredentialStore):
+    def __init__(self, credential_store: CredentialStore, config: Optional[Config] = None):
         self._cred_store = credential_store
+        self._config = config
 
     # ------------------------------------------------------------------
     # Session factory
@@ -42,6 +44,8 @@ class SSHHandler:
             key_file=params["key_file"],
             passphrase1=self._cred_store.get_passphrase1(connection.id) or "",
             passphrase2=self._cred_store.get_passphrase2(connection.id) or "",
+            timeout=int(self._config.get("ssh_connection_timeout", 30)) if self._config else 30,
+            keepalive=int(self._config.get("ssh_keepalive_interval", 60)) if self._config else 60,
             term_type=connection.term_type or "xterm-256color",
             tunnels=params["tunnels"],
         )

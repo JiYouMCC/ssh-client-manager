@@ -103,7 +103,7 @@ class MainWindow(QMainWindow):
         self.config = config
         self.connection_manager = ConnectionManager()
         self.credential_store = CredentialStore()
-        self.ssh_handler = SSHHandler(self.credential_store)
+        self.ssh_handler = SSHHandler(self.credential_store, self.config)
         self.snippets_manager = SnippetsManager() if _HAS_SNIPPETS else None
         self._snippets_dialog: Optional[object] = None
 
@@ -130,9 +130,7 @@ class MainWindow(QMainWindow):
         self.terminal_panel = TerminalPanel(self.config)
         self.sidebar = Sidebar(self.connection_manager, self.credential_store)
 
-        self._sender_panel = SenderPanel()
-        self._sender_panel.send_to_active.connect(self._on_sender_to_active)
-        self._sender_panel.send_to_all.connect(self._on_sender_to_all)
+        self._sender_panel = SenderPanel(self.terminal_panel)
 
         self._splitter = QSplitter(Qt.Orientation.Horizontal)
         self._splitter.addWidget(self.sidebar)

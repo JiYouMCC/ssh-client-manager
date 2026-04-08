@@ -331,7 +331,7 @@ class TerminalPanel(QWidget):
             from .ssh_handler import SSHHandler
             from .credential_store import CredentialStore
             store = CredentialStore()
-            handler = SSHHandler(store)
+            handler = SSHHandler(store, self.config)
             session = handler.create_session(conn)
             title = conn.name or conn.display_name()
             self.new_tab(session, conn, title)

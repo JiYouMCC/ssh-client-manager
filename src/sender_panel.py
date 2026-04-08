@@ -6,6 +6,7 @@ to the active terminal or broadcast to all open terminals at once.
 """
 
 import re
+import shlex
 
 from PySide6.QtCore import Qt, Signal, QRegularExpression
 from PySide6.QtGui import (
@@ -14,7 +15,8 @@ from PySide6.QtGui import (
 )
 from PySide6.QtWidgets import (
     QWidget, QVBoxLayout, QHBoxLayout, QPlainTextEdit,
-    QPushButton, QLabel, QCheckBox, QFrame, QSizePolicy,
+    QPushButton, QLabel, QCheckBox, QFrame, QSizePolicy, QDialog,
+    QDialogButtonBox,
 )
 
 
@@ -95,8 +97,11 @@ class SenderPanel(QWidget):
     send_to_active = Signal(str)
     send_to_all    = Signal(str)
 
-    def __init__(self, parent=None):
+    _VAR_PATTERN = re.compile(r"\{([a-zA-Z_]\w*)\}")
+
+    def __init__(self, terminal_panel, parent=None):
         super().__init__(parent)
+        self._terminal_panel = terminal_panel
         self._build_ui()
 
     # ------------------------------------------------------------------
@@ -160,7 +165,22 @@ class SenderPanel(QWidget):
         self._editor.installEventFilter(self)
         root.addWidget(self._editor)
 
+        self._lbl_templates = QLabel(
+            "Template vars: {name} {host} {user} {port} {group} {index} {target}"
+        )
+        self._lbl_templates.setStyleSheet("color: #8c8fa1; font-size: 11px;")
+        root.addWidget(self._lbl_templates)
+
         # ── Options ─────────────────────────────────────────────────
+        self._chk_wrap = QCheckBox("Wrap long lines in editor")
+        self._chk_wrap.setChecked(False)
+        self._chk_wrap.setToolTip(
+            "When checked, long lines are visually wrapped in the editor.\n"
+            "Uncheck to keep one command per physical line with horizontal scrolling."
+        )
+        self._chk_wrap.toggled.connect(self._on_toggle_wrap)
+        root.addWidget(self._chk_wrap)
+
         self._chk_line_by_line = QCheckBox("Send line-by-line (add ↵ after each line)")
         self._chk_line_by_line.setChecked(True)
         self._chk_line_by_line.setToolTip(
@@ -185,6 +205,12 @@ class SenderPanel(QWidget):
         self._btn_send.clicked.connect(self._on_send_active)
         btn_row.addWidget(self._btn_send)
 
+        self._btn_preview_active = QPushButton("🧪 Preview Active")
+        self._btn_preview_active.setToolTip("Render template for active target only")
+        self._btn_preview_active.setFixedHeight(28)
+        self._btn_preview_active.clicked.connect(self._on_preview_active)
+        btn_row.addWidget(self._btn_preview_active)
+
         self._btn_broadcast = QPushButton("📡  Broadcast to All")
         self._btn_broadcast.setToolTip("Send to every open terminal  (Ctrl+Shift+Enter)")
         self._btn_broadcast.setFixedHeight(28)
@@ -197,7 +223,17 @@ class SenderPanel(QWidget):
         self._btn_broadcast.clicked.connect(self._on_send_all)
         btn_row.addWidget(self._btn_broadcast)
 
+        self._btn_preview_all = QPushButton("🧪 Preview All")
+        self._btn_preview_all.setToolTip("Render template for all open terminals")
+        self._btn_preview_all.setFixedHeight(28)
+        self._btn_preview_all.clicked.connect(self._on_preview_all)
+        btn_row.addWidget(self._btn_preview_all)
+
         root.addLayout(btn_row)
+
+        self._lbl_result = QLabel("")
+        self._lbl_result.setStyleSheet("color: #5c5f77; font-size: 11px;")
+        root.addWidget(self._lbl_result)
 
     # ------------------------------------------------------------------
     # Key shortcuts inside the editor
@@ -223,37 +259,176 @@ class SenderPanel(QWidget):
     # ------------------------------------------------------------------
 
     def _build_payload(self) -> str:
-        """Return the text to send.
-
-        Line-by-line mode: each line gets a trailing \\r\\n (CR+LF) so the
-        shell treats it as Enter. Plain paste mode: send the raw text as-is.
-        """
+        """Return raw editor text."""
         text = self._editor.toPlainText()
-        if not text.strip():
-            return ""
+        return text if text.strip() else ""
+
+    @staticmethod
+    def _parse_target(command: str) -> tuple[str, str, str]:
+        """Parse SSH command into (user, host, port)."""
+        if not command:
+            return "", "", "22"
+        try:
+            parts = shlex.split(command)
+        except ValueError:
+            parts = command.split()
+        user = ""
+        host = ""
+        port = "22"
+        i = 1 if parts and parts[0] == "ssh" else 0
+        positional = []
+        while i < len(parts):
+            arg = parts[i]
+            if arg == "-p" and i + 1 < len(parts):
+                port = parts[i + 1]
+                i += 2
+                continue
+            if arg in ("-l", "--login-name") and i + 1 < len(parts):
+                user = parts[i + 1]
+                i += 2
+                continue
+            if arg.startswith("-"):
+                i += 2 if len(arg) == 2 and i + 1 < len(parts) else 1
+                continue
+            positional.append(arg)
+            i += 1
+        if positional:
+            dest = positional[-1]
+            if "@" in dest:
+                user, host = dest.rsplit("@", 1)
+            else:
+                host = dest
+        return user, host, port
+
+    def _build_context(self, term, index: int) -> dict[str, str]:
+        conn = getattr(term, "connection", None)
+        name = (conn.name if conn and conn.name else "").strip() if conn else ""
+        group = (conn.group if conn and conn.group else "").strip() if conn else ""
+        command = (conn.command if conn and conn.command else "").strip() if conn else ""
+        user, host, port = self._parse_target(command)
+        if not name:
+            name = host or f"terminal-{index}"
+        target = f"{user}@{host}" if user and host else (host or name)
+        return {
+            "name": name,
+            "host": host,
+            "user": user,
+            "port": port,
+            "group": group,
+            "index": str(index),
+            "target": target,
+        }
+
+    def _render_template(self, text: str, context: dict[str, str]) -> str:
+        def repl(match):
+            key = match.group(1)
+            return context.get(key, match.group(0))
+        return self._VAR_PATTERN.sub(repl, text)
+
+    def _to_wire_payload(self, text: str) -> str:
         if self._chk_line_by_line.isChecked():
-            lines = text.splitlines()
-            # Strip trailing whitespace per line, join with CR+LF so every
-            # line is submitted as a separate Enter keystroke.
-            return "".join(line.rstrip() + "\r\n" for line in lines)
+            return "".join(line.rstrip() + "\r\n" for line in text.splitlines())
         return text
+
+    def _collect_targets(self, all_targets: bool):
+        if all_targets:
+            return list(self._terminal_panel.get_all_terminals())
+        active = self._terminal_panel.active_terminal
+        return [active] if active is not None else []
+
+    def _show_preview_dialog(self, title: str, content: str):
+        dlg = QDialog(self)
+        dlg.setWindowTitle(title)
+        dlg.resize(860, 560)
+        v = QVBoxLayout(dlg)
+        editor = QPlainTextEdit()
+        editor.setReadOnly(True)
+        editor.setPlainText(content)
+        v.addWidget(editor)
+        buttons = QDialogButtonBox(QDialogButtonBox.StandardButton.Close)
+        buttons.rejected.connect(dlg.reject)
+        buttons.accepted.connect(dlg.accept)
+        v.addWidget(buttons)
+        dlg.exec()
+
+    def _preview(self, all_targets: bool):
+        text = self._build_payload()
+        if not text:
+            self._lbl_result.setText("Nothing to preview.")
+            return
+        targets = self._collect_targets(all_targets)
+        if not targets:
+            self._lbl_result.setText("No target terminals available.")
+            return
+        blocks = []
+        for idx, term in enumerate(targets, start=1):
+            ctx = self._build_context(term, idx)
+            rendered = self._render_template(text, ctx)
+            conn_state = "connected" if term.is_connected() else "disconnected"
+            blocks.append(
+                f"[{idx}] {ctx['target']} ({conn_state})\n"
+                f"{rendered}"
+            )
+        title = "Sender Preview — All Targets" if all_targets else "Sender Preview — Active Target"
+        self._show_preview_dialog(title, "\n\n" + ("\n\n" + ("-" * 72) + "\n\n").join(blocks))
+        self._lbl_result.setText(f"Previewed {len(blocks)} target(s).")
+
+    def _dispatch(self, all_targets: bool):
+        text = self._build_payload()
+        if not text:
+            self._lbl_result.setText("Nothing to send.")
+            return
+        targets = self._collect_targets(all_targets)
+        if not targets:
+            self._lbl_result.setText("No target terminals available.")
+            return
+        sent = 0
+        skipped = []
+        for idx, term in enumerate(targets, start=1):
+            ctx = self._build_context(term, idx)
+            if not term.is_connected():
+                skipped.append(f"{ctx['target']} (disconnected)")
+                continue
+            rendered = self._render_template(text, ctx)
+            wire = self._to_wire_payload(rendered)
+            if wire:
+                term.send_text(wire)
+                sent += 1
+        total = len(targets)
+        if skipped:
+            preview = ", ".join(skipped[:3])
+            suffix = "…" if len(skipped) > 3 else ""
+            self._lbl_result.setText(
+                f"Sent: {sent}/{total}, skipped: {len(skipped)} ({preview}{suffix})"
+            )
+        else:
+            self._lbl_result.setText(f"Sent: {sent}/{total}, skipped: 0.")
 
     # ------------------------------------------------------------------
     # Slots
     # ------------------------------------------------------------------
 
     def _on_send_active(self):
-        payload = self._build_payload()
-        if payload:
-            self.send_to_active.emit(payload)
+        self._dispatch(all_targets=False)
 
     def _on_send_all(self):
-        payload = self._build_payload()
-        if payload:
-            self.send_to_all.emit(payload)
+        self._dispatch(all_targets=True)
+
+    def _on_preview_active(self):
+        self._preview(all_targets=False)
+
+    def _on_preview_all(self):
+        self._preview(all_targets=True)
 
     def _on_clear(self):
         self._editor.clear()
+
+    def _on_toggle_wrap(self, checked: bool):
+        mode = (
+            QPlainTextEdit.LineWrapMode.WidgetWidth
+            if checked else QPlainTextEdit.LineWrapMode.NoWrap
+        )
+        self._editor.setLineWrapMode(mode)
 
     # ------------------------------------------------------------------
     # Public

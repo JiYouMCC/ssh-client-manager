@@ -67,6 +67,8 @@ class TerminalWidget(QWidget):
         self._session: Optional[BaseSession] = None
         self._connected = False
         self._is_recording = False
+        self._manual_stop_requested = False
+        self._reconnect_attempts = 0
 
         layout = QVBoxLayout(self)
         layout.setContentsMargins(0, 0, 0, 0)
@@ -118,17 +120,19 @@ class TerminalWidget(QWidget):
         """Re-create session for this connection and reconnect."""
         if self.connection is None:
             return
+        self._manual_stop_requested = False
         self._reconnect_bar.hide()
         # Import lazily to avoid circular imports
         try:
             from .ssh_handler import SSHHandler
             from .credential_store import CredentialStore
             store = CredentialStore()
-            handler = SSHHandler(store)
+            handler = SSHHandler(store, self.config)
             session = handler.create_session(self.connection)
             self.start_session(session)
-        except Exception as e:
+        except Exception:
             self._reconnect_bar.show()
+            self._schedule_auto_reconnect()
 
     # ------------------------------------------------------------------
     # Public API
@@ -137,6 +141,7 @@ class TerminalWidget(QWidget):
     def start_session(self, session: BaseSession):
         """Attach a session and load the terminal page."""
         self._session = session
+        self._manual_stop_requested = False
         session.on_disconnected = self._on_disconnected
 
         # Attach logging if enabled
@@ -163,6 +168,7 @@ class TerminalWidget(QWidget):
 
     def stop_session(self):
         if self._session:
+            self._manual_stop_requested = True
             self._session.stop()
             self._session = None
         self._connected = False
@@ -335,18 +341,35 @@ class TerminalWidget(QWidget):
         url = QUrl(f"file:///{html_path.as_posix()}?{query}")
         self._view.load(url)
         self._connected = True
+        self._reconnect_attempts = 0
 
     def _on_js_title(self, title: str):
         if title and title != "terminal.html":
             self.title_changed.emit(title)
 
     def _on_disconnected(self):
+        if self._manual_stop_requested:
+            self._manual_stop_requested = False
+            return
         self._connected = False
         if self._is_recording:
             self.stop_recording()
         self.child_exited.emit()
         if self.connection is not None:
             self._reconnect_bar.show()
+            self._schedule_auto_reconnect()
+
+    def _schedule_auto_reconnect(self):
+        if self.connection is None:
+            return
+        if not self.config.get("ssh_auto_reconnect", True):
+            return
+        max_retries = max(0, int(self.config.get("ssh_auto_reconnect_max_retries", 3)))
+        if self._reconnect_attempts >= max_retries:
+            return
+        delay_seconds = max(1, int(self.config.get("ssh_auto_reconnect_delay", 5)))
+        self._reconnect_attempts += 1
+        QTimer.singleShot(delay_seconds * 1000, self._on_reconnect)
 
     # ------------------------------------------------------------------
     # Context menu

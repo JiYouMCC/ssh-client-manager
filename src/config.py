@@ -48,6 +48,9 @@ DEFAULTS = {
     "ssh_default_port": 22,
     "ssh_keepalive_interval": 60,
     "ssh_connection_timeout": 30,
+    "ssh_auto_reconnect": True,
+    "ssh_auto_reconnect_delay": 5,
+    "ssh_auto_reconnect_max_retries": 3,
     # Global passphrases (up to 5)
     "global_passphrases": [],
     # Behavior

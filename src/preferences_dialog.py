@@ -119,6 +119,20 @@ class PreferencesDialog(QDialog):
         self._spin_timeout.setValue(self.config["ssh_connection_timeout"])
         form.addRow("Connection Timeout (s):", self._spin_timeout)
 
+        self._chk_auto_reconnect = QCheckBox()
+        self._chk_auto_reconnect.setChecked(self.config.get("ssh_auto_reconnect", True))
+        form.addRow("Auto Reconnect:", self._chk_auto_reconnect)
+
+        self._spin_reconnect_delay = _NoScrollSpin()
+        self._spin_reconnect_delay.setRange(1, 300)
+        self._spin_reconnect_delay.setValue(self.config.get("ssh_auto_reconnect_delay", 5))
+        form.addRow("Reconnect Delay (s):", self._spin_reconnect_delay)
+
+        self._spin_reconnect_retries = _NoScrollSpin()
+        self._spin_reconnect_retries.setRange(0, 20)
+        self._spin_reconnect_retries.setValue(self.config.get("ssh_auto_reconnect_max_retries", 3))
+        form.addRow("Reconnect Retries:", self._spin_reconnect_retries)
+
         return w
 
     def _build_logging_tab(self) -> QWidget:
@@ -285,6 +299,9 @@ class PreferencesDialog(QDialog):
         # SSH
         self.config["ssh_keepalive_interval"] = self._spin_keepalive.value()
         self.config["ssh_connection_timeout"] = self._spin_timeout.value()
+        self.config["ssh_auto_reconnect"] = self._chk_auto_reconnect.isChecked()
+        self.config["ssh_auto_reconnect_delay"] = self._spin_reconnect_delay.value()
+        self.config["ssh_auto_reconnect_max_retries"] = self._spin_reconnect_retries.value()
         # Logging
         self.config["terminal_logging_enabled"] = self._chk_logging.isChecked()
         self.config["terminal_log_dir"] = self._entry_log_dir.text().strip()
